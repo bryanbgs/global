@@ -1,4 +1,4 @@
-aiohttp==3.9.1
-aiofiles==23.2.1
+Flask==3.0.3
+requests==2.32.3
+beautifulsoup4==4.12.3
 gunicorn==21.2.0
-aiohttp-wsgi==0.9.1
