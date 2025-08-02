@@ -1,792 +1,296 @@
-#!/usr/bin/env python3
-"""
-Proxy Inverso M3U8 Extractor - Versión para Render
-Extrae URLs M3U8 de streamtpglobal.com y las sirve sin restricciones de IP
-"""
-
-import asyncio
-import aiohttp
-import re
 import os
-import logging
-from urllib.parse import urljoin, urlparse, parse_qs
-from aiohttp import web, ClientSession, ClientTimeout
-import json
+import re
 import time
-from typing import Dict, List, Optional
 import threading
+import requests
+from flask import Flask, Response, request, abort, url_for
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, quote, unquote
 
-# Configuración de logging más detallado
-logging.basicConfig(
-    level=logging.DEBUG if os.environ.get('DEBUG') else logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
 
-# Log inicial del sistema
-logger.info("🚀 Iniciando M3U8 Proxy Server")
-logger.info(f"🐍 Python version: {os.sys.version}")
-logger.info(f"🌐 Environment: {'RENDER' if 'RENDER' in os.environ else 'LOCAL'}")
-logger.info(f"🔧 Debug mode: {os.environ.get('DEBUG', 'False')}")
+BASE_URL = "https://streamtpglobal.com/global1.php?stream={}"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://streamtpglobal.com/",
+    "Origin": "https://streamtpglobal.com",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Connection": "keep-alive"
+}
 
-class M3U8ProxyServer:
-    def __init__(self, port: int = 8080):
-        self.port = port
-        self.app = web.Application()
-        self.session: Optional[ClientSession] = None
-        self.channel_cache: Dict[str, dict] = {}
-        self.cache_ttl = 300  # 5 minutos de cache
-        
-        # Headers para simular navegador real
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
-        }
-        
-        self.setup_routes()
-        
-    def setup_routes(self):
-        """Configura las rutas del servidor"""
-        self.app.router.add_get('/', self.home)
-        self.app.router.add_get('/playlist.m3u8', self.generate_playlist)
-        self.app.router.add_get('/channel/{channel}', self.serve_channel)
-        self.app.router.add_get('/proxy/{channel}', self.proxy_m3u8)
-        self.app.router.add_get('/segment/{channel}/{path:.*}', self.proxy_segment)
-        self.app.router.add_post('/upload_channels', self.upload_channels)
-        self.app.router.add_get('/debug', self.debug_info)
-        self.app.router.add_get('/html/{channel}', self.get_raw_html)
-        
-        # Middleware para CORS
-        self.app.middlewares.append(self.cors_middleware)
-        
-        # Log de rutas configuradas
-        logger.info("🛣️ Rutas configuradas:")
-        for route in self.app.router.routes():
-            logger.info(f"   {route.method} {route.resource.canonical}")
-            
-    async def debug_info(self, request: web.Request) -> web.Response:
-        """Información de debug del sistema"""
-        try:
-            import sys
-            import platform
-            
-            debug_data = {
-                "system_info": {
-                    "platform": platform.platform(),
-                    "python_version": sys.version,
-                    "aiohttp_version": aiohttp.__version__,
-                },
-                "environment": {
-                    "PORT": os.environ.get('PORT', 'Not set'),
-                    "RENDER": 'RENDER' in os.environ,
-                    "DEBUG": os.environ.get('DEBUG', 'Not set'),
-                    "Environment_vars_count": len(os.environ)
-                },
-                "session_info": {
-                    "session_initialized": self.session is not None and not self.session.closed if self.session else False,
-                    "cache_entries": len(self.channel_cache),
-                    "cached_channels": list(self.channel_cache.keys())
-                },
-                "server_info": {
-                    "host": request.host,
-                    "scheme": request.scheme,
-                    "client_ip": request.remote,
-                    "user_agent": request.headers.get('User-Agent', 'Not provided')[:100]
-                }
-            }
-            
-            return web.json_response(debug_data, indent=2)
-            
-        except Exception as e:
-            logger.error(f"💥 Error en debug_info: {str(e)}")
-            import traceback
-            logger.error(f"📋 Traceback: {traceback.format_exc()}")
-            return web.json_response({"error": str(e)}, status=500)
-            
-    async def get_raw_html(self, request: web.Request) -> web.Response:
-        """Obtiene el HTML raw de un canal para análisis manual"""
-        channel = request.match_info['channel']
-        
-        try:
-            await self.init_session()
-            url = f"https://streamtpglobal.com/global1.php?stream={channel}"
-            
-            request_headers = self.headers.copy()
-            request_headers.update({
-                'Referer': 'https://streamtpglobal.com/',
-                'Origin': 'https://streamtpglobal.com'
-            })
-            
-            async with self.session.get(url, headers=request_headers) as response:
-                if response.status != 200:
-                    return web.Response(text=f"Error HTTP {response.status}", status=response.status)
-                
-                html_content = await response.text()
-                
-                # Formatear para mejor legibilidad
-                formatted_html = html_content.replace('><', '>\n<')
-                
-                return web.Response(
-                    text=formatted_html,
-                    content_type='text/plain; charset=utf-8',
-                    headers={'Content-Disposition': f'inline; filename="{channel}.html"'}
-                )
-                
-        except Exception as e:
-            logger.error(f"💥 Error obteniendo HTML para {channel}: {str(e)}")
-            return web.Response(text=f"Error: {str(e)}", status=500)
-        
-    @web.middleware
-    async def cors_middleware(self, request, handler):
-        """Middleware para manejar CORS"""
-        response = await handler(request)
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        return response
-        
-    async def init_session(self):
-        """Inicializa la sesión HTTP"""
-        if not self.session or self.session.closed:
-            timeout = ClientTimeout(total=30, connect=10)
-            connector = aiohttp.TCPConnector(
-                ssl=False, 
-                limit=100,
-                limit_per_host=20,
-                ttl_dns_cache=300,
-                use_dns_cache=True
-            )
-            
-            self.session = ClientSession(
-                timeout=timeout,
-                headers=self.headers,
-                connector=connector
-            )
-            
-            logger.info("🌐 Sesión HTTP inicializada")
-            
-            # Probar conectividad básica
-            await self.test_connectivity()
-            
-    async def test_connectivity(self):
-        """Prueba la conectividad con el sitio objetivo"""
-        try:
-            test_url = "https://streamtpglobal.com/"
-            logger.info(f"🔌 Probando conectividad con: {test_url}")
-            
-            async with self.session.get(test_url, headers=self.headers) as response:
-                logger.info(f"✅ Conectividad OK: {response.status}")
-                logger.info(f"📡 Server: {response.headers.get('server', 'unknown')}")
-                
-                if response.status == 200:
-                    content_preview = (await response.text())[:200]
-                    logger.debug(f"🔍 Preview del contenido: {content_preview}")
-                    
-        except Exception as e:
-            logger.warning(f"⚠️ Error en prueba de conectividad: {str(e)}")
-            # No fallar aquí, solo advertir
-            
-    async def cleanup_session(self):
-        """Limpia la sesión HTTP"""
-        if self.session and not self.session.closed:
-            await self.session.close()
-            
-    async def extract_m3u8_url(self, channel: str) -> Optional[str]:
-        """Extrae la URL M3U8 real de streamtpglobal"""
-        await self.init_session()
-        
-        try:
-            url = f"https://streamtpglobal.com/global1.php?stream={channel}"
-            logger.info(f"🔍 Extrayendo M3U8 para canal: {channel}")
-            logger.info(f"🌐 URL construida: {url}")
-            
-            # Headers adicionales para mejor compatibilidad
-            request_headers = self.headers.copy()
-            request_headers.update({
-                'Referer': 'https://streamtpglobal.com/',
-                'Origin': 'https://streamtpglobal.com',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-            })
-            
-            async with self.session.get(url, headers=request_headers, allow_redirects=True) as response:
-                logger.info(f"📡 Respuesta HTTP: {response.status} para {url}")
-                logger.info(f"📋 Headers de respuesta: {dict(response.headers)}")
-                
-                if response.status != 200:
-                    logger.error(f"❌ Error HTTP {response.status} para canal {channel}")
-                    return None
-                    
-                html_content = await response.text()
-                logger.info(f"📄 Tamaño del contenido HTML: {len(html_content)} caracteres")
-                
-                # Log del contenido HTML para debug (más extenso)
-                logger.debug(f"🔍 HTML content preview (primeros 2000 chars):\n{html_content[:2000]}")
-                
-                # Primero, buscar datos codificados en base64 en el JavaScript
-                # Basado en los logs, veo que hay un array Ky con datos codificados
-                base64_pattern = r'["\'][A-Za-z0-9+/=]{20,}["\']'
-                base64_matches = re.findall(base64_pattern, html_content)
-                
-                logger.info(f"🔍 Encontrados {len(base64_matches)} strings que parecen base64")
-                
-                for i, b64_match in enumerate(base64_matches[:10]):  # Solo los primeros 10
-                    try:
-                        # Limpiar comillas
-                        clean_b64 = b64_match.strip('"\'')
-                        # Intentar decodificar
-                        decoded = base64.b64decode(clean_b64 + '==').decode('utf-8', errors='ignore')
-                        logger.debug(f"🔓 Base64 {i+1} decodificado: {decoded}")
-                        
-                        # Buscar URLs M3U8 en el contenido decodificado
-                        if '.m3u8' in decoded and 'http' in decoded:
-                            logger.info(f"🎯 Posible URL M3U8 en base64: {decoded}")
-                            
-                            # Extraer la URL completa
-                            url_pattern = r'https?://[^\s<>"\']+\.m3u8[^\s<>"\']*'
-                            urls_in_decoded = re.findall(url_pattern, decoded)
-                            if urls_in_decoded:
-                                logger.info(f"🏆 URL M3U8 encontrada en base64: {urls_in_decoded[0]}")
-                                return urls_in_decoded[0]
-                                
-                    except Exception as decode_error:
-                        logger.debug(f"⚠️ Error decodificando base64 {i+1}: {decode_error}")
-                
-                # Buscar en variables JavaScript específicas
-                js_patterns = [
-                    r'playbackURL\s*=\s*["\']([^"\']+)["\']',
-                    r'var\s+\w*[uU]rl\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'let\s+\w*[uU]rl\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'const\s+\w*[uU]rl\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'source\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'src\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                ]
-                
-                for i, pattern in enumerate(js_patterns):
-                    matches = re.findall(pattern, html_content, re.IGNORECASE)
-                    if matches:
-                        logger.info(f"🎯 Patrón JS {i+1} encontró: {matches}")
-                        for match in matches:
-                            if match and '.m3u8' in match:
-                                logger.info(f"🏆 URL M3U8 encontrada en JS: {match}")
-                                return match
-                
-                # Buscar patrones de URLs M3U8 directas
-                direct_patterns = [
-                    r'https://[^/\s"\']+\.crackstreamslivehd\.com/[^/\s"\']+/tracks-v1a1/mono\.m3u8\?ip=[^&\s"\']+&token=[^"\s\']+',
-                    r'https://[^"\s\']+\.m3u8\?ip=[^&\s"\']+&token=[^"\s\']+',
-                    r'"(https://[^"]+\.m3u8[^"]*)"',
-                    r"'(https://[^']+\.m3u8[^']*)'",
-                    r'["\']([^"\']*\.m3u8[^"\']*)["\']',
-                ]
-                
-                all_matches = []
-                for i, pattern in enumerate(direct_patterns):
-                    try:
-                        matches = re.findall(pattern, html_content, re.IGNORECASE | re.MULTILINE)
-                        if matches:
-                            logger.info(f"🎯 Patrón directo {i+1} encontró {len(matches)} coincidencias: {matches}")
-                            all_matches.extend(matches)
-                        else:
-                            logger.debug(f"⭕ Patrón directo {i+1} no encontró coincidencias")
-                    except Exception as pattern_error:
-                        logger.error(f"❌ Error en patrón directo {i+1}: {pattern_error}")
-                
-                # Filtrar y validar URLs encontradas
-                valid_urls = []
-                for match in all_matches:
-                    if isinstance(match, tuple):
-                        match = match[0] if match else ""
-                    
-                    match = match.strip()
-                    if match and '.m3u8' in match:
-                        # Validar que sea una URL completa
-                        if match.startswith('http'):
-                            valid_urls.append(match)
-                            logger.info(f"✅ URL válida encontrada: {match}")
-                        else:
-                            logger.debug(f"⚠️ URL relativa encontrada: {match}")
-                
-                if valid_urls:
-                    # Priorizar URLs de crackstreamslivehd
-                    prioritized_urls = [url for url in valid_urls if 'crackstreamslivehd.com' in url]
-                    if prioritized_urls:
-                        selected_url = prioritized_urls[0]
-                        logger.info(f"🏆 URL M3U8 SELECCIONADA (prioridad crackstreamslivehd): {selected_url}")
-                        return selected_url
-                    else:
-                        selected_url = valid_urls[0]
-                        logger.info(f"🏆 URL M3U8 SELECCIONADA (primera válida): {selected_url}")
-                        return selected_url
-                
-                # Análisis más profundo del JavaScript
-                logger.info("🔍 Analizando JavaScript más profundamente...")
-                
-                # Buscar en el array Ky que veo en los logs
-                ky_pattern = r'Ky\s*=\s*\[(.*?)\]'
-                ky_match = re.search(ky_pattern, html_content, re.DOTALL)
-                if ky_match:
-                    ky_content = ky_match.group(1)
-                    logger.info(f"🎯 Encontrado array Ky: {ky_content[:200]}...")
-                    
-                    # Extraer todos los strings base64 del array
-                    ky_b64_pattern = r'"([A-Za-z0-9+/=]{20,})"'
-                    ky_b64_matches = re.findall(ky_b64_pattern, ky_content)
-                    
-                    logger.info(f"🔍 Encontrados {len(ky_b64_matches)} elementos base64 en array Ky")
-                    
-                    for i, ky_b64 in enumerate(ky_b64_matches[:20]):  # Solo los primeros 20
-                        try:
-                            decoded_ky = base64.b64decode(ky_b64 + '==').decode('utf-8', errors='ignore')
-                            logger.debug(f"🔓 Ky[{i}] decodificado: {decoded_ky}")
-                            
-                            # Buscar patrones de URLs o dominios
-                            if any(domain in decoded_ky.lower() for domain in ['crackstream', 'stream', '.com', '.m3u8']):
-                                logger.info(f"🎯 Elemento Ky interesante: {decoded_ky}")
-                                
-                        except Exception as ky_error:
-                            logger.debug(f"⚠️ Error decodificando Ky[{i}]: {ky_error}")
-                
-                # Si aún no encontramos nada, buscar en scripts embebidos
-                logger.info("🔍 Buscando en scripts embebidos...")
-                script_pattern = r'<script[^>]*>(.*?)</script>'
-                scripts = re.findall(script_pattern, html_content, re.DOTALL | re.IGNORECASE)
-                
-                for i, script in enumerate(scripts):
-                    logger.debug(f"📜 Analizando script {i+1} (longitud: {len(script)})")
-                    if len(script) > 100:  # Solo scripts con contenido sustancial
-                        script_matches = re.findall(r'["\']([^"\']*\.m3u8[^"\']*)["\']', script)
-                        if script_matches:
-                            logger.info(f"🎯 Script {i+1} contiene URLs M3U8: {script_matches}")
-                            for script_match in script_matches:
-                                if script_match.startswith('http'):
-                                    logger.info(f"🏆 URL M3U8 encontrada en script: {script_match}")
-                                    return script_match
-                
-                logger.warning(f"❌ No se encontró URL M3U8 para canal: {channel}")
-                logger.info(f"📊 Total de patrones probados: {len(direct_patterns)}")
-                logger.info(f"📊 Total de scripts analizados: {len(scripts)}")
-                
-                # Guardar más contenido HTML para debug
-                debug_content = html_content[:3000] if len(html_content) > 3000 else html_content
-                logger.debug(f"🔍 Contenido HTML extendido para debug:\n{debug_content}")
-                
-                return None
-                
-        except Exception as e:
-            logger.error(f"💥 Error extrayendo M3U8 para {channel}: {str(e)}")
-            import traceback
-            logger.error(f"📋 Traceback: {traceback.format_exc()}")
-            return None
-            
-    async def get_cached_channel(self, channel: str) -> Optional[dict]:
-        """Obtiene información del canal desde cache"""
-        if channel in self.channel_cache:
-            cache_data = self.channel_cache[channel]
-            if time.time() - cache_data['timestamp'] < self.cache_ttl:
-                return cache_data
-            else:
-                del self.channel_cache[channel]
-        return None
-        
-    async def cache_channel(self, channel: str, m3u8_url: str):
-        """Cachea información del canal"""
-        self.channel_cache[channel] = {
-            'url': m3u8_url,
-            'timestamp': time.time(),
-            'base_url': '/'.join(m3u8_url.split('/')[:-1]) + '/'
-        }
-        
-    async def home(self, request: web.Request) -> web.Response:
-        """Página principal"""
-        host = request.headers.get('Host', 'localhost:8080')
-        base_url = f"https://{host}" if 'render' in host else f"http://{host}"
-        
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>M3U8 Proxy Server</title>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
-                .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                textarea {{ width: 100%; height: 200px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }}
-                button {{ padding: 12px 25px; margin: 10px 0; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }}
-                button:hover {{ background: #0056b3; }}
-                .url {{ background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #007bff; }}
-                .status {{ padding: 10px; margin: 10px 0; border-radius: 5px; }}
-                .success {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
-                .error {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }}
-                a {{ color: #007bff; text-decoration: none; }}
-                a:hover {{ text-decoration: underline; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🎬 M3U8 Proxy Server</h1>
-                <p>Servidor proxy para extraer y servir streams M3U8 sin restricciones de IP</p>
-                
-                <h2>📋 Subir Lista de Canales</h2>
-                <form id="channelForm">
-                    <textarea id="channels" placeholder="Ingresa los canales, uno por línea. Ejemplo:&#10;espn&#10;fox1&#10;cnn&#10;discovery"></textarea>
-                    <br>
-                    <button type="submit">🚀 Procesar Canales</button>
-                </form>
-                
-                <div id="status"></div>
-                
-                <h2>📺 Playlist Principal</h2>
-                <div class="url">
-                    <strong>📁 Playlist M3U8 Completa:</strong><br>
-                    <a href="/playlist.m3u8" target="_blank">{base_url}/playlist.m3u8</a>
-                </div>
-                
-                <h2>🎯 Canales Individuales</h2>
-                <div id="channelList"></div>
-                
-                <h2>📖 Instrucciones</h2>
-                <ul>
-                    <li>Sube tu lista de canales usando el formulario</li>
-                    <li>Usa la URL del playlist principal en tu reproductor favorito</li>
-                    <li>También puedes acceder a canales individuales</li>
-                    <li>Las URLs generadas no tienen restricciones de IP</li>
-                </ul>
-                
-                <script>
-                    const baseUrl = '{base_url}';
-                    
-                    document.getElementById('channelForm').onsubmit = async (e) => {{
-                        e.preventDefault();
-                        const channels = document.getElementById('channels').value;
-                        const statusDiv = document.getElementById('status');
-                        
-                        if (!channels.trim()) {{
-                            statusDiv.innerHTML = '<div class="status error">❌ Por favor ingresa al menos un canal</div>';
-                            return;
-                        }}
-                        
-                        statusDiv.innerHTML = '<div class="status">⏳ Procesando canales...</div>';
-                        
-                        try {{
-                            const response = await fetch('/upload_channels', {{
-                                method: 'POST',
-                                headers: {{'Content-Type': 'application/json'}},
-                                body: JSON.stringify({{channels: channels}})
-                            }});
-                            
-                            const result = await response.json();
-                            
-                            if (result.status === 'success') {{
-                                statusDiv.innerHTML = '<div class="status success">✅ Canales procesados correctamente</div>';
-                                updateChannelList(result.channels);
-                            }} else {{
-                                statusDiv.innerHTML = `<div class="status error">❌ Error: ${{result.message}}</div>`;
-                            }}
-                        }} catch (error) {{
-                            statusDiv.innerHTML = `<div class="status error">❌ Error de conexión: ${{error.message}}</div>`;
-                        }}
-                    }};
-                    
-                    function updateChannelList(channels) {{
-                        const list = document.getElementById('channelList');
-                        if (channels.length === 0) {{
-                            list.innerHTML = '<p>No hay canales configurados</p>';
-                            return;
-                        }}
-                        
-                        list.innerHTML = channels.map(channel => 
-                            `<div class="url">
-                                <strong>📺 ${{channel.toUpperCase()}}:</strong><br>
-                                <a href="/channel/${{channel}}" target="_blank">${{baseUrl}}/channel/${{channel}}</a>
-                            </div>`
-                        ).join('');
-                    }}
-                    
-                    // Cargar canales existentes al inicio
-                    fetch('/playlist.m3u8').then(response => {{
-                        if (response.ok) {{
-                            return response.text();
-                        }}
-                    }}).then(data => {{
-                        if (data && data.includes('#EXTINF')) {{
-                            const channels = data.match(/#EXTINF:-1,([^\\n]+)/g);
-                            if (channels) {{
-                                const channelNames = channels.map(line => line.replace('#EXTINF:-1,', '').toLowerCase());
-                                updateChannelList(channelNames);
-                            }}
-                        }}
-                    }}).catch(() => {{
-                        // Ignorar errores de carga inicial
-                    }});
-                </script>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return web.Response(text=html, content_type='text/html')
-        
-    async def upload_channels(self, request: web.Request) -> web.Response:
-        """Procesa la lista de canales subida"""
-        try:
-            data = await request.json()
-            channels_text = data.get('channels', '')
-            channels = [ch.strip() for ch in channels_text.split('\n') if ch.strip()]
-            
-            if not channels:
-                return web.json_response({'status': 'error', 'message': 'No se encontraron canales válidos'})
-            
-            # Guardar canales en archivo
-            try:
-                with open('channels.txt', 'w', encoding='utf-8') as f:
-                    for channel in channels:
-                        f.write(f"{channel}\n")
-            except Exception as e:
-                logger.error(f"Error guardando canales: {str(e)}")
-                
-            return web.json_response({'status': 'success', 'channels': channels})
-            
-        except Exception as e:
-            logger.error(f"Error procesando canales: {str(e)}")
-            return web.json_response({'status': 'error', 'message': str(e)})
-            
-    async def load_channels(self) -> List[str]:
-        """Carga la lista de canales desde archivo"""
-        try:
-            if os.path.exists('channels.txt'):
-                with open('channels.txt', 'r', encoding='utf-8') as f:
-                    return [line.strip() for line in f if line.strip()]
-            return []
-        except Exception as e:
-            logger.error(f"Error cargando canales: {str(e)}")
-            return []
-            
-    async def generate_playlist(self, request: web.Request) -> web.Response:
-        """Genera playlist M3U8 con todos los canales"""
-        try:
-            channels = await self.load_channels()
-            if not channels:
-                return web.Response(text="#EXTM3U\n# No hay canales configurados", 
-                                  content_type='application/vnd.apple.mpegurl',
-                                  status=200)
-                
-            host = request.headers.get('Host', 'localhost:8080')
-            base_url = f"https://{host}" if 'render' in host else f"http://{host}"
-            
-            m3u8_content = "#EXTM3U\n"
-            
-            for channel in channels:
-                m3u8_content += f"#EXTINF:-1,{channel.upper()}\n"
-                m3u8_content += f"{base_url}/channel/{channel}\n"
-                
-            return web.Response(
-                text=m3u8_content,
-                content_type='application/vnd.apple.mpegurl',
-                headers={
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': 'no-cache'
-                }
-            )
-            
-        except Exception as e:
-            logger.error(f"Error generando playlist: {str(e)}")
-            return web.Response(text="Error interno del servidor", status=500)
-            
-    async def serve_channel(self, request: web.Request) -> web.Response:
-        """Sirve un canal específico"""
-        channel = request.match_info['channel']
-        client_ip = request.remote or 'unknown'
-        user_agent = request.headers.get('User-Agent', 'unknown')
-        
-        logger.info(f"📺 Solicitud para canal: {channel}")
-        logger.info(f"🌐 IP cliente: {client_ip}")
-        logger.info(f"🔧 User-Agent: {user_agent[:100]}...")
-        
-        try:
-            # Verificar cache
-            cached = await self.get_cached_channel(channel)
-            if cached:
-                logger.info(f"💾 Usando URL desde cache para {channel}: {cached['url']}")
-                return await self.proxy_m3u8_content(cached['url'])
-            
-            logger.info(f"🔄 Cache miss para {channel}, extrayendo nueva URL...")
-            
-            # Extraer nueva URL
-            m3u8_url = await self.extract_m3u8_url(channel)
-            if not m3u8_url:
-                logger.error(f"❌ No se pudo extraer URL M3U8 para canal: {channel}")
-                return web.Response(
-                    text=f"Canal {channel} no disponible actualmente. Intenta más tarde.",
-                    status=404,
-                    headers={'Content-Type': 'text/plain; charset=utf-8'}
-                )
-                
-            logger.info(f"✅ URL M3U8 extraída exitosamente para {channel}: {m3u8_url}")
-            
-            # Cachear y servir
-            await self.cache_channel(channel, m3u8_url)
-            logger.info(f"💾 URL cacheada para {channel}")
-            
-            return await self.proxy_m3u8_content(m3u8_url)
-            
-        except Exception as e:
-            logger.error(f"💥 Error sirviendo canal {channel}: {str(e)}")
-            import traceback
-            logger.error(f"📋 Traceback completo: {traceback.format_exc()}")
-            return web.Response(text="Error interno del servidor", status=500)
-            
-    async def proxy_m3u8_content(self, original_url: str) -> web.Response:
-        """Obtiene y modifica el contenido M3U8"""
-        await self.init_session()
-        
-        try:
-            logger.info(f"🎬 Obteniendo contenido M3U8 de: {original_url}")
-            
-            # Headers específicos para M3U8
-            m3u8_headers = self.headers.copy()
-            m3u8_headers.update({
-                'Accept': 'application/vnd.apple.mpegurl,video/mp2t,*/*',
-                'Referer': 'https://streamtpglobal.com/'
-            })
-            
-            async with self.session.get(original_url, headers=m3u8_headers) as response:
-                logger.info(f"📡 Respuesta M3U8: {response.status} - Content-Type: {response.headers.get('content-type')}")
-                
-                if response.status != 200:
-                    logger.error(f"❌ Error obteniendo M3U8: {response.status}")
-                    return web.Response(text="Stream no disponible", status=404)
-                    
-                content = await response.text()
-                logger.info(f"📄 Contenido M3U8 obtenido: {len(content)} caracteres")
-                logger.debug(f"🔍 Primeras 10 líneas del M3U8:\n{chr(10).join(content.split(chr(10))[:10])}")
-                
-                # Verificar que el contenido sea válido M3U8
-                if not content.strip().startswith('#EXTM3U'):
-                    logger.warning(f"⚠️ El contenido no parece ser un M3U8 válido")
-                    logger.debug(f"🔍 Contenido recibido: {content[:500]}")
-                
-                # Modificar URLs relativas en el M3U8
-                base_url = '/'.join(original_url.split('/')[:-1]) + '/'
-                logger.info(f"🔗 URL base para segmentos: {base_url}")
-                
-                modified_content = self.modify_m3u8_content(content, base_url)
-                logger.info(f"✅ Contenido M3U8 modificado exitosamente")
-                
-                return web.Response(
-                    text=modified_content,
-                    content_type='application/vnd.apple.mpegurl',
-                    headers={
-                        'Access-Control-Allow-Origin': '*',
-                        'Cache-Control': 'no-cache',
-                        'Content-Disposition': 'inline'
-                    }
-                )
-                
-        except Exception as e:
-            logger.error(f"💥 Error obteniendo contenido M3U8: {str(e)}")
-            import traceback
-            logger.error(f"📋 Traceback: {traceback.format_exc()}")
-            return web.Response(text="Error obteniendo stream", status=500)
-            
-    def modify_m3u8_content(self, content: str, base_url: str) -> str:
-        """Modifica el contenido M3U8 para usar el proxy"""
-        lines = content.split('\n')
-        modified_lines = []
-        
-        for line in lines:
-            if line.strip() and not line.startswith('#'):
-                # Es una URL de segmento
-                if line.startswith('http'):
-                    # URL absoluta - mantener como está por ahora
-                    modified_lines.append(line)
-                else:
-                    # URL relativa - convertir a absoluta
-                    absolute_url = urljoin(base_url, line)
-                    modified_lines.append(absolute_url)
-            else:
-                modified_lines.append(line)
-                
-        return '\n'.join(modified_lines)
-        
-    async def proxy_m3u8(self, request: web.Request) -> web.Response:
-        """Proxy para archivos M3U8"""
-        channel = request.match_info['channel']
-        return await self.serve_channel(request)
-        
-    async def proxy_segment(self, request: web.Request) -> web.Response:
-        """Proxy para segmentos de video"""
-        channel = request.match_info['channel']
-        path = request.match_info['path']
-        
-        await self.init_session()
-        
-        try:
-            cached = await self.get_cached_channel(channel)
-            if not cached:
-                return web.Response(text="Canal no encontrado", status=404)
-                
-            segment_url = cached['base_url'] + path
-            
-            async with self.session.get(segment_url, headers=self.headers) as response:
-                if response.status != 200:
-                    return web.Response(text="Segmento no disponible", status=404)
-                    
-                content = await response.read()
-                content_type = response.headers.get('content-type', 'video/mp2t')
-                
-                return web.Response(
-                    body=content,
-                    content_type=content_type,
-                    headers={'Access-Control-Allow-Origin': '*'}
-                )
-                
-        except Exception as e:
-            logger.error(f"Error proxy segmento: {str(e)}")
-            return web.Response(text="Error obteniendo segmento", status=500)
+STREAM_CACHE = {}
+CACHE_TTL = 300  # 5 minutos de caché
+LOCK = threading.Lock()
 
-# Instancia global del servidor
-proxy_server = M3U8ProxyServer()
-
-# Función para crear la aplicación WSGI
-def create_app():
-    """Crea la aplicación para Gunicorn"""
-    return proxy_server.app
-
-# Variable app requerida por Gunicorn
-app = create_app()
-
-# Función principal para desarrollo local
-async def main():
-    """Función principal para desarrollo local"""
-    port = int(os.environ.get('PORT', 8080))
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"Servidor iniciado en http://0.0.0.0:{port}")
-    logger.info(f"Playlist disponible en: http://0.0.0.0:{port}/playlist.m3u8")
-    
+def load_channels():
+    channels = []
     try:
-        await asyncio.Future()  # Mantener el servidor corriendo
-    except KeyboardInterrupt:
-        logger.info("Deteniendo servidor...")
-    finally:
-        await proxy_server.cleanup_session()
-        await runner.cleanup()
+        with open("canales.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    channels.append(line)
+    except FileNotFoundError:
+        print("⚠️ canales.txt no encontrado. Creando archivo vacío.")
+        open("canales.txt", "w").close()
+    return channels
+
+CHANNELS = load_channels()
+
+def extract_m3u8_url(canal):
+    url = BASE_URL.format(canal)
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        scripts = soup.find_all('script')
+
+        for script in scripts:
+            if script.string:
+                # Regex mejorado para capturar cualquier m3u8 con token
+                match = re.search(
+                    r'(https?://[^\s\'"\\<>]+\.m3u8\?ip=[^\s\'"\\<>]+&token=[^\s\'"\\<>]+)',
+                    script.string
+                )
+                if match:
+                    return match.group(1)
+                    
+        # Segunda estrategia: buscar en iframe src
+        iframe = soup.find('iframe')
+        if iframe and 'src' in iframe.attrs:
+            iframe_src = iframe['src']
+            if 'm3u8' in iframe_src:
+                return iframe_src
+                
+    except Exception as e:
+        print(f"❌ Error extrayendo m3u8 para {canal}: {e}")
+    return None
+
+def rewrite_m3u8(content, base_url, canal):
+    """Reescribe TODO el contenido del M3U8 para que todas las URLs pasen por el proxy"""
+    lines = content.splitlines()
+    rewritten = []
+    in_segment = False
+
+    for line in lines:
+        stripped = line.strip()
+        
+        # 1. Líneas de metadatos (EXTINF, etc.)
+        if stripped.startswith('#EXTINF:'):
+            rewritten.append(line)
+            in_segment = True
+            continue
+            
+        # 2. Líneas de segmentos (las que siguen a EXTINF)
+        if in_segment and stripped:
+            # Asegurar que la URL sea absoluta
+            if not stripped.startswith('http'):
+                abs_url = urljoin(base_url, stripped)
+            else:
+                abs_url = stripped
+                
+            # Codificar la URL para el proxy
+            encoded_url = quote(abs_url, safe='')
+            proxy_url = url_for('proxy_segment', canal=canal, real_url=encoded_url, _external=True)
+            rewritten.append(proxy_url)
+            in_segment = False
+            continue
+            
+        # 3. Líneas de claves (EXT-X-KEY)
+        if '#EXT-X-KEY' in stripped and 'URI="' in stripped:
+            # Reescribir la URL de la clave
+            new_line = re.sub(
+                r'(URI=")([^"]+)"', 
+                lambda m: f'{m.group(1)}{url_for("proxy_segment", canal=canal, real_url=quote(m.group(2), safe=""), _external=True)}"', 
+                stripped
+            )
+            rewritten.append(new_line)
+            continue
+            
+        # 4. Otras líneas (dejarlas igual)
+        rewritten.append(line)
+
+    return "\n".join(rewritten)
+
+@app.route('/stream/<canal>.m3u8')
+def proxy_playlist(canal):
+    if canal not in CHANNELS:
+        abort(404, "Canal no encontrado")
+
+    # Obtener o actualizar caché
+    cached = STREAM_CACHE.get(canal)
+    if not cached or time.time() > cached.get('expires', 0):
+        with LOCK:
+            m3u8_url = extract_m3u8_url(canal)
+            if m3u8_url:
+                # Calcular base_url correctamente
+                parsed = urlparse(m3u8_url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}{os.path.dirname(parsed.path)}/"
+                
+                STREAM_CACHE[canal] = {
+                    'm3u8_url': m3u8_url,
+                    'base_url': base_url,
+                    'expires': time.time() + CACHE_TTL
+                }
+            else:
+                abort(500, "No se pudo obtener el stream")
+
+    cache_info = STREAM_CACHE[canal]
+    m3u8_url = cache_info['m3u8_url']
+
+    try:
+        # Obtener el M3U8 original con headers actualizados
+        r = requests.get(
+            m3u8_url, 
+            headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
+            timeout=10
+        )
+        r.raise_for_status()
+
+        # Reescribir el contenido
+        content = r.text
+        rewritten_content = rewrite_m3u8(content, cache_info['base_url'], canal)
+
+        # Configurar headers para HLS
+        response = Response(rewritten_content, mimetype="application/x-mpegurl")
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        return response
+
+    except Exception as e:
+        print(f"❌ Error al obtener .m3u8: {e}")
+        abort(502, "Error de conexión con el origen")
+
+@app.route('/proxy/segment/<canal>')
+def proxy_segment(canal):
+    if canal not in CHANNELS:
+        abort(404, "Canal no encontrado")
+
+    encoded_url = request.args.get("real_url")
+    if not encoded_url:
+        abort(400, "URL no especificada")
+
+    try:
+        # Decodificar la URL
+        real_url = unquote(encoded_url)
+        
+        # Descargar el recurso (ts, key, m3u8)
+        r = requests.get(
+            real_url, 
+            headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
+            stream=True, 
+            timeout=15,
+            verify=False  # Necesario para algunos servidores con SSL mal configurado
+        )
+        r.raise_for_status()
+
+        # Configurar headers para HLS
+        headers = {}
+        for key, value in r.headers.items():
+            if key.lower() not in ['content-length', 'connection', 'transfer-encoding']:
+                headers[key] = value
+        headers['Access-Control-Allow-Origin'] = '*'
+        headers['Cache-Control'] = 'no-cache'
+
+        # Determinar el tipo de contenido adecuado
+        content_type = 'video/MP2T' if '.ts' in real_url else 'application/octet-stream'
+        headers['Content-Type'] = content_type
+
+        # Devolver el contenido
+        return Response(
+            r.iter_content(chunk_size=8192),
+            status=r.status_code,
+            headers=headers,
+            content_type=content_type
+        )
+
+    except Exception as e:
+        print(f"❌ Error proxyeando segmento: {e}")
+        abort(502, "Error al obtener el segmento")
+
+@app.route('/m3u')
+def generate_m3u():
+    base = request.host_url.rstrip("/")
+    lines = ["#EXTM3U x-tvg-url=\"https://iptv-org.github.io/epg/guides/tvplus.com.epg.xml\""]
+
+    for canal in CHANNELS:
+        lines.append(
+            f'#EXTINF:-1 tvg-id="{canal}" tvg-name="{canal.title()}" '
+            f'group-title="StreamTPGlobal",{canal.title()}\n'
+            f'{base}/stream/{canal}.m3u8'
+        )
+
+    response = Response("\n".join(lines), mimetype="application/x-mpegurl")
+    response.headers['Content-Disposition'] = 'attachment; filename="streamtpglobal_proxy.m3u"'
+    return response
+
+@app.route('/')
+def home():
+    base = request.host_url.rstrip("/")
+    links = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>📡 Proxy HLS de StreamTPGlobal</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+            h1 { color: #333; }
+            ul { list-style-type: none; padding: 0; }
+            li { padding: 8px 0; border-bottom: 1px solid #eee; }
+            a { text-decoration: none; color: #0066cc; }
+            a:hover { text-decoration: underline; }
+            .btn { 
+                display: inline-block; 
+                background: #0066cc; 
+                color: white; 
+                padding: 10px 15px; 
+                border-radius: 5px; 
+                margin-top: 20px; 
+            }
+            .btn:hover { background: #0055aa; }
+        </style>
+    </head>
+    <body>
+        <h1>📡 Proxy HLS de StreamTPGlobal</h1>
+        <p>Proxy que elimina restricciones de IP y token para los canales.</p>
+        <ul>
+    '''
+    
+    for canal in CHANNELS:
+        links += f'<li><a href="/stream/{canal}.m3u8">{canal}</a> | '
+        links += f'<a href="{base}/stream/{canal}.m3u8" target="_blank">🔗 URL</a></li>'
+    
+    links += '''
+        </ul>
+        <a href="/m3u" class="btn">📥 Descargar lista M3U completa</a>
+        <p><small>Actualización automática cada 5 minutos</small></p>
+    </body>
+    </html>
+    '''
+    return links
+
+# Refresco automático en segundo plano
+def background_refresh():
+    while True:
+        time.sleep(240)  # Actualizar cada 4 minutos
+        print("🔄 Actualizando caché de streams...")
+        for canal in CHANNELS:
+            try:
+                threading.Thread(target=extract_m3u8_url, args=(canal,), daemon=True).start()
+            except Exception as e:
+                print(f"Error en refresco automático para {canal}: {e}")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    # Iniciar hilo de refresco
+    threading.Thread(target=background_refresh, daemon=True).start()
+    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
