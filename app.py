@@ -11,22 +11,24 @@ from urllib.parse import urljoin, urlparse, quote, unquote
 app = Flask(__name__)
 
 # URL base CORREGIDA para streamtpglobal.com
-BASE_URL = "https://streamtpglobal.com/global2.php?stream={}"
+BASE_URL = "https://streamtpglobal.com/global1.php?stream={}"
 
-# Headers mejorados para simular un navegador real
+# Headers COMPLETOS simulando exactamente lo que envía el navegador
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "*/*",
+    "Accept-Language": "es-419,es;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
     "Referer": "https://streamtpglobal.com/",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0"
+    "Origin": "https://streamtpglobal.com",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Priority": "u=1, i",
+    "Sec-Ch-Ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"'
 }
 
 STREAM_CACHE = {}
@@ -52,34 +54,33 @@ CHANNELS = load_channels()
 def extract_m3u8_url(canal):
     url = BASE_URL.format(canal)
     try:
+        print(f"🔍 Iniciando extracción para {canal} desde {url}")
         session = requests.Session()
         session.headers.update(HEADERS)
         
         # Paso 1: Obtener la página principal
-        print(f"🔍 Obteniendo página principal para {canal}: {url}")
-        response = session.get(url, timeout=15)
+        print(f"🌐 Obteniendo página principal...")
+        response = session.get(url, timeout=20)
         response.raise_for_status()
+        print(f"✅ Página principal obtenida (tamaño: {len(response.text)} bytes)")
         
-        # Manejar posibles redirecciones de Cloudflare
+        # Verificar si hay Cloudflare
         if "cloudflare" in response.text.lower() or "checking your browser" in response.text.lower():
-            print("🛡️ Detectado Cloudflare, intentando resolver...")
-            # Simular comportamiento de navegador para evitar bloqueos
-            session.headers.update({
-                "Sec-Ch-Ua": '"Chromium";v="138", "Google Chrome";v="138", "Not=A?Brand";v="99"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"'
-            })
-            # Intentar nuevamente con headers adicionales
-            response = session.get(url, timeout=20)
+            print("🛡️ Detectado Cloudflare - intentando resolver...")
+            # Simular comportamiento de navegador más realista
+            time.sleep(1)  # Simular tiempo de carga del navegador
+            response = session.get(url, timeout=25)
         
         # Paso 2: Buscar la URL M3U8 en el HTML
-        print(f"🔍 Analizando contenido para encontrar M3U8...")
+        print(f"🔍 Buscando URL M3U8 en el contenido...")
         soup = BeautifulSoup(response.content, 'html.parser')
         
         # Método 1: Buscar en todos los scripts
         scripts = soup.find_all('script')
-        for script in scripts:
+        print(f"🔍 Analizando {len(scripts)} scripts...")
+        for i, script in enumerate(scripts):
             if script.string and "m3u8" in script.string:
+                print(f"📝 Script #{i} contiene 'm3u8', analizando...")
                 # Regex mejorada para capturar cualquier URL M3U8
                 match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', script.string)
                 if match:
@@ -87,18 +88,25 @@ def extract_m3u8_url(canal):
                     print(f"✅ M3U8 encontrado en script: {m3u8_url}")
                     return m3u8_url
         
-        # Método 2: Buscar en iframes (común en estos sitios)
+        # Método 2: Buscar en iframes
         iframes = soup.find_all('iframe')
-        for iframe in iframes:
+        print(f"🔍 Analizando {len(iframes)} iframes...")
+        for i, iframe in enumerate(iframes):
             src = iframe.get('src', '')
-            if src and "m3u8" in src:
-                print(f"✅ M3U8 encontrado en iframe: {src}")
-                return src
-            
-            # Intentar cargar el iframe si tiene una URL relativa
-            if src and not src.startswith('http'):
-                iframe_url = urljoin(url, src)
-                iframe_response = session.get(iframe_url, timeout=15)
+            if src:
+                print(f"📝 Iframe #{i} src: {src}")
+                if "m3u8" in src:
+                    print(f"✅ M3U8 encontrado en iframe src: {src}")
+                    return src
+                
+                # Intentar cargar el iframe
+                if src.startswith('http'):
+                    iframe_url = src
+                else:
+                    iframe_url = urljoin(url, src)
+                
+                print(f"🌐 Cargando iframe desde: {iframe_url}")
+                iframe_response = session.get(iframe_url, timeout=20)
                 iframe_match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', iframe_response.text)
                 if iframe_match:
                     m3u8_url = iframe_match.group(1)
@@ -106,22 +114,27 @@ def extract_m3u8_url(canal):
                     return m3u8_url
         
         # Método 3: Buscar en todo el HTML
+        print("🔍 Buscando en todo el HTML...")
         match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', response.text)
         if match:
             m3u8_url = match.group(1)
             print(f"✅ M3U8 encontrado en HTML: {m3u8_url}")
             return m3u8_url
-            
-        # Método 4: Si todo falla, intentar con una petición AJAX directa
-        # Algunos sitios usan endpoints específicos para obtener la URL
-        ajax_url = f"https://streamtpglobal.com/api/stream.php?stream={canal}"
-        ajax_response = session.get(ajax_url, timeout=15)
-        if ajax_response.status_code == 200:
-            ajax_match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', ajax_response.text)
-            if ajax_match:
-                m3u8_url = ajax_match.group(1)
-                print(f"✅ M3U8 encontrado en API: {m3u8_url}")
-                return m3u8_url
+        
+        # Método 4: Buscar en elementos específicos (común en estos sitios)
+        print("🔍 Buscando en elementos específicos...")
+        video_elements = soup.find_all(['video', 'source', 'iframe', 'script'])
+        for element in video_elements:
+            for attr in ['src', 'data-src', 'data-url', 'src-hls', 'source']:
+                value = element.get(attr, '')
+                if value and "m3u8" in value:
+                    if value.startswith('http'):
+                        print(f"✅ M3U8 encontrado en {element.name}[{attr}]: {value}")
+                        return value
+                    else:
+                        full_url = urljoin(url, value)
+                        print(f"✅ M3U8 relativo encontrado en {element.name}[{attr}]: {full_url}")
+                        return full_url
         
         print(f"❌ No se encontró URL M3U8 para {canal}")
         return None
@@ -174,7 +187,7 @@ def rewrite_m3u8(content, base_url, canal):
         rewritten.append(line)
     
     rewritten_content = "\n".join(rewritten)
-    print(f"📝 M3U8 reescrito:\n{rewritten_content[:500]}...")
+    print(f"📝 M3U8 reescrito (tamaño: {len(rewritten_content)} bytes)")
     return rewritten_content
 
 @app.route('/stream/<canal>.m3u8')
@@ -211,12 +224,18 @@ def proxy_playlist(canal):
     
     try:
         print(f"⬇️ Descargando M3U8 original: {m3u8_url}")
-        # Obtener el M3U8 original
+        # Obtener el M3U8 original con TODOS los headers necesarios
         r = requests.get(
             m3u8_url, 
             headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
-            timeout=15
+            timeout=20,
+            allow_redirects=True  # Importante para seguir redirecciones
         )
+        print(f"📡 Estado de la respuesta M3U8: {r.status_code}")
+        if r.status_code != 200:
+            print(f"❌ Error HTTP {r.status_code} al obtener el M3U8")
+            print(f"Contenido de error: {r.text[:500]}")
+        
         r.raise_for_status()
         print(f"✅ M3U8 descargado exitosamente (tamaño: {len(r.text)} bytes)")
         
@@ -229,6 +248,7 @@ def proxy_playlist(canal):
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         response.headers['Content-Type'] = 'application/x-mpegurl'
+        response.headers['Accept-Ranges'] = 'bytes'
         print(f"✅ Playlist reescrito y listo para enviar")
         return response
     except Exception as e:
@@ -253,24 +273,32 @@ def proxy_segment(canal):
         real_url = unquote(encoded_url)
         print(f"➡️ Solicitud de segmento para {canal}: {real_url}")
         
-        # Descargar el recurso (ts, key, m3u8)
+        # Descargar el recurso (ts, key, m3u8) con TODOS los headers necesarios
         r = requests.get(
             real_url, 
-            headers=HEADERS, 
+            headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
             stream=True, 
-            timeout=20,
+            timeout=25,
             verify=False  # Necesario para algunos servidores con SSL mal configurado
         )
+        print(f"📡 Estado de la respuesta segmento: {r.status_code}")
+        if r.status_code != 200:
+            print(f"❌ Error HTTP {r.status_code} al obtener el segmento")
+        
         r.raise_for_status()
         print(f"✅ Segmento descargado exitosamente (tamaño: {len(r.content)} bytes)")
         
         # Configurar headers para HLS
         headers = {}
         for key, value in r.headers.items():
+            # Mantener todos los headers importantes
             if key.lower() not in ['content-length', 'connection', 'transfer-encoding']:
                 headers[key] = value
+        
+        # Asegurar headers necesarios para HLS
         headers['Access-Control-Allow-Origin'] = '*'
-        headers['Cache-Control'] = 'no-cache'
+        headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        headers['Accept-Ranges'] = 'bytes'
         
         # Devolver el contenido
         return Response(
