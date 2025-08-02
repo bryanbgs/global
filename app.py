@@ -1,354 +1,394 @@
 # app.py - Versión definitiva para streamtpglobal.com
-import os
+#!/usr/bin/env python3
+"""
+Proxy Inverso M3U8 Extractor
+Extrae URLs M3U8 de streamtpglobal.com y las sirve sin restricciones de IP
+"""
+
+import asyncio
+import aiohttp
 import re
+import os
+import logging
+from urllib.parse import urljoin, urlparse, parse_qs
+from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp.web import Response, Request
+import json
 import time
-import threading
-import requests
-from flask import Flask, Response, request, abort, url_for
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, quote, unquote
+from typing import Dict, List, Optional
+import base64
+import hashlib
 
-app = Flask(__name__)
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# URL base CORREGIDA para streamtpglobal.com
-BASE_URL = "https://streamtpglobal.com/global1.php?stream={}"
-
-# Headers COMPLETOS simulando exactamente lo que envía el navegador
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "es-419,es;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Connection": "keep-alive",
-    "Referer": "https://streamtpglobal.com/",
-    "Origin": "https://streamtpglobal.com",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-    "Priority": "u=1, i",
-    "Sec-Ch-Ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"'
-}
-
-STREAM_CACHE = {}
-CACHE_TTL = 300
-LOCK = threading.Lock()
-
-def load_channels():
-    channels = []
-    try:
-        with open("canales.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    channels.append(line)
-    except FileNotFoundError:
-        print("⚠️ canales.txt no encontrado")
-        # Incluimos fox1ar que es el canal que estás probando
-        channels = ["fox1ar", "espn", "espn2", "foxsports", "beinsports"]
-    return channels
-
-CHANNELS = load_channels()
-
-def extract_m3u8_url(canal):
-    url = BASE_URL.format(canal)
-    try:
-        print(f"🔍 Iniciando extracción para {canal} desde {url}")
-        session = requests.Session()
-        session.headers.update(HEADERS)
+class M3U8ProxyServer:
+    def __init__(self, port: int = 8080):
+        self.port = port
+        self.app = web.Application()
+        self.session: Optional[ClientSession] = None
+        self.channel_cache: Dict[str, dict] = {}
+        self.cache_ttl = 300  # 5 minutos de cache
         
-        # Paso 1: Obtener la página principal
-        print(f"🌐 Obteniendo página principal...")
-        response = session.get(url, timeout=20)
-        response.raise_for_status()
-        print(f"✅ Página principal obtenida (tamaño: {len(response.text)} bytes)")
+        # Headers para simular navegador real
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        }
         
-        # Verificar si hay Cloudflare
-        if "cloudflare" in response.text.lower() or "checking your browser" in response.text.lower():
-            print("🛡️ Detectado Cloudflare - intentando resolver...")
-            # Simular comportamiento de navegador más realista
-            time.sleep(1)  # Simular tiempo de carga del navegador
-            response = session.get(url, timeout=25)
+        self.setup_routes()
         
-        # Paso 2: Buscar la URL M3U8 en el HTML
-        print(f"🔍 Buscando URL M3U8 en el contenido...")
-        soup = BeautifulSoup(response.content, 'html.parser')
+    def setup_routes(self):
+        """Configura las rutas del servidor"""
+        self.app.router.add_get('/', self.home)
+        self.app.router.add_get('/playlist.m3u8', self.generate_playlist)
+        self.app.router.add_get('/channel/{channel}', self.serve_channel)
+        self.app.router.add_get('/proxy/{channel}', self.proxy_m3u8)
+        self.app.router.add_get('/segment/{channel}/{path:.*}', self.proxy_segment)
+        self.app.router.add_post('/upload_channels', self.upload_channels)
         
-        # Método 1: Buscar en todos los scripts
-        scripts = soup.find_all('script')
-        print(f"🔍 Analizando {len(scripts)} scripts...")
-        for i, script in enumerate(scripts):
-            if script.string and "m3u8" in script.string:
-                print(f"📝 Script #{i} contiene 'm3u8', analizando...")
-                # Regex mejorada para capturar cualquier URL M3U8
-                match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', script.string)
-                if match:
-                    m3u8_url = match.group(1)
-                    print(f"✅ M3U8 encontrado en script: {m3u8_url}")
-                    return m3u8_url
+    async def init_session(self):
+        """Inicializa la sesión HTTP"""
+        timeout = ClientTimeout(total=30, connect=10)
+        self.session = ClientSession(
+            timeout=timeout,
+            headers=self.headers,
+            connector=aiohttp.TCPConnector(ssl=False, limit=100)
+        )
         
-        # Método 2: Buscar en iframes
-        iframes = soup.find_all('iframe')
-        print(f"🔍 Analizando {len(iframes)} iframes...")
-        for i, iframe in enumerate(iframes):
-            src = iframe.get('src', '')
-            if src:
-                print(f"📝 Iframe #{i} src: {src}")
-                if "m3u8" in src:
-                    print(f"✅ M3U8 encontrado en iframe src: {src}")
-                    return src
+    async def cleanup_session(self):
+        """Limpia la sesión HTTP"""
+        if self.session:
+            await self.session.close()
+            
+    async def extract_m3u8_url(self, channel: str) -> Optional[str]:
+        """Extrae la URL M3U8 real de streamtpglobal"""
+        try:
+            url = f"https://streamtpglobal.com/global1.php?stream={channel}"
+            logger.info(f"Extrayendo M3U8 para canal: {channel}")
+            
+            async with self.session.get(url, headers=self.headers) as response:
+                if response.status != 200:
+                    logger.error(f"Error HTTP {response.status} para canal {channel}")
+                    return None
+                    
+                html_content = await response.text()
                 
-                # Intentar cargar el iframe
-                if src.startswith('http'):
-                    iframe_url = src
-                else:
-                    iframe_url = urljoin(url, src)
+                # Buscar URLs M3U8 usando múltiples patrones
+                patterns = [
+                    r'https://[^/]+\.crackstreamslivehd\.com/[^/]+/tracks-v1a1/mono\.m3u8\?ip=[^&]+&token=[^"\s]+',
+                    r'https://[^"]+\.m3u8\?ip=[^&]+&token=[^"]+',
+                    r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                    r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                    r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']'
+                ]
                 
-                print(f"🌐 Cargando iframe desde: {iframe_url}")
-                iframe_response = session.get(iframe_url, timeout=20)
-                iframe_match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', iframe_response.text)
-                if iframe_match:
-                    m3u8_url = iframe_match.group(1)
-                    print(f"✅ M3U8 encontrado en iframe cargado: {m3u8_url}")
-                    return m3u8_url
-        
-        # Método 3: Buscar en todo el HTML
-        print("🔍 Buscando en todo el HTML...")
-        match = re.search(r'(https?://[^\s\'"\\]+\.m3u8[^\s\'"]*)', response.text)
-        if match:
-            m3u8_url = match.group(1)
-            print(f"✅ M3U8 encontrado en HTML: {m3u8_url}")
-            return m3u8_url
-        
-        # Método 4: Buscar en elementos específicos (común en estos sitios)
-        print("🔍 Buscando en elementos específicos...")
-        video_elements = soup.find_all(['video', 'source', 'iframe', 'script'])
-        for element in video_elements:
-            for attr in ['src', 'data-src', 'data-url', 'src-hls', 'source']:
-                value = element.get(attr, '')
-                if value and "m3u8" in value:
-                    if value.startswith('http'):
-                        print(f"✅ M3U8 encontrado en {element.name}[{attr}]: {value}")
-                        return value
-                    else:
-                        full_url = urljoin(url, value)
-                        print(f"✅ M3U8 relativo encontrado en {element.name}[{attr}]: {full_url}")
-                        return full_url
-        
-        print(f"❌ No se encontró URL M3U8 para {canal}")
-        return None
-        
-    except Exception as e:
-        print(f"❌ Error extrayendo m3u8 para {canal}: {str(e)}")
-        import traceback
-        print(f" traceback: {traceback.format_exc()}")
-        return None
-
-def rewrite_m3u8(content, base_url, canal):
-    """Reescribe TODO el contenido del M3U8 para que todas las URLs pasen por el proxy"""
-    print(f"🔄 Reescribiendo M3U8 para {canal}")
-    lines = content.splitlines()
-    rewritten = []
-    in_segment = False
-    for line in lines:
-        stripped = line.strip()
-        # 1. Líneas de metadatos (EXTINF, etc.)
-        if stripped.startswith('#EXTINF:'):
-            rewritten.append(line)
-            in_segment = True
-            continue
-        # 2. Líneas de segmentos (las que siguen a EXTINF)
-        if in_segment and stripped:
-            # Asegurar que la URL sea absoluta
-            if not stripped.startswith('http'):
-                abs_url = urljoin(base_url, stripped)
+                for pattern in patterns:
+                    matches = re.findall(pattern, html_content, re.IGNORECASE)
+                    if matches:
+                        m3u8_url = matches[0]
+                        logger.info(f"URL M3U8 encontrada para {channel}: {m3u8_url}")
+                        return m3u8_url
+                
+                # Buscar en JavaScript embebido
+                js_pattern = r'var\s+\w+\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']'
+                js_matches = re.findall(js_pattern, html_content, re.IGNORECASE)
+                if js_matches:
+                    return js_matches[0]
+                
+                logger.warning(f"No se encontró URL M3U8 para canal: {channel}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error extrayendo M3U8 para {channel}: {str(e)}")
+            return None
+            
+    async def get_cached_channel(self, channel: str) -> Optional[dict]:
+        """Obtiene información del canal desde cache"""
+        if channel in self.channel_cache:
+            cache_data = self.channel_cache[channel]
+            if time.time() - cache_data['timestamp'] < self.cache_ttl:
+                return cache_data
             else:
-                abs_url = stripped
-            print(f"🔗 Segmento encontrado: {abs_url}")
-            # Codificar la URL para el proxy
-            encoded_url = quote(abs_url, safe='')
-            proxy_url = url_for('proxy_segment', canal=canal, real_url=encoded_url, _external=True)
-            rewritten.append(proxy_url)
-            in_segment = False
-            continue
-        # 3. Líneas de claves (EXT-X-KEY)
-        if '#EXT-X-KEY' in stripped and 'URI="' in stripped:
-            print(f"🔑 Clave encontrada: {stripped}")
-            # Reescribir la URL de la clave
-            new_line = re.sub(
-                r'(URI=")([^"]+)"', 
-                lambda m: f'{m.group(1)}{url_for("proxy_segment", canal=canal, real_url=quote(m.group(2), safe=""), _external=True)}"', 
-                stripped
-            )
-            rewritten.append(new_line)
-            continue
-        # 4. Otras líneas (dejarlas igual)
-        rewritten.append(line)
-    
-    rewritten_content = "\n".join(rewritten)
-    print(f"📝 M3U8 reescrito (tamaño: {len(rewritten_content)} bytes)")
-    return rewritten_content
-
-@app.route('/stream/<canal>.m3u8')
-def proxy_playlist(canal):
-    if canal not in CHANNELS:
-        print(f"❌ Canal '{canal}' no está en la lista de canales permitidos")
-        abort(404, "Canal no encontrado")
-    
-    print(f"➡️ Solicitud recibida para /stream/{canal}.m3u8")
-    
-    # Obtener o actualizar caché
-    cached = STREAM_CACHE.get(canal)
-    if not cached or time.time() > cached.get('expires', 0):
-        with LOCK:
-            print(f"🔄 Actualizando caché para {canal}")
-            m3u8_url = extract_m3u8_url(canal)
-            if m3u8_url:
-                # Calcular base_url correctamente
-                parsed = urlparse(m3u8_url)
-                base_url = f"{parsed.scheme}://{parsed.netloc}{os.path.dirname(parsed.path)}/"
-                STREAM_CACHE[canal] = {
-                    'm3u8_url': m3u8_url,
-                    'base_url': base_url,
-                    'expires': time.time() + CACHE_TTL
+                del self.channel_cache[channel]
+        return None
+        
+    async def cache_channel(self, channel: str, m3u8_url: str):
+        """Cachea información del canal"""
+        self.channel_cache[channel] = {
+            'url': m3u8_url,
+            'timestamp': time.time(),
+            'base_url': '/'.join(m3u8_url.split('/')[:-1]) + '/'
+        }
+        
+    async def home(self, request: Request) -> Response:
+        """Página principal"""
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>M3U8 Proxy Server</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; }
+                .container { max-width: 800px; margin: 0 auto; }
+                textarea { width: 100%; height: 200px; }
+                button { padding: 10px 20px; margin: 10px 0; }
+                .url { background: #f0f0f0; padding: 10px; margin: 10px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>M3U8 Proxy Server</h1>
+                <p>Servidor proxy para extraer y servir streams M3U8 sin restricciones de IP</p>
+                
+                <h2>Subir Lista de Canales</h2>
+                <form id="channelForm">
+                    <textarea id="channels" placeholder="Ingresa los canales, uno por línea. Ejemplo:&#10;espn&#10;fox1&#10;cnn"></textarea>
+                    <br>
+                    <button type="submit">Procesar Canales</button>
+                </form>
+                
+                <h2>URLs Generadas</h2>
+                <div class="url">
+                    <strong>Playlist M3U8:</strong><br>
+                    <a href="/playlist.m3u8" target="_blank">{{base_url}}/playlist.m3u8</a>
+                </div>
+                
+                <h2>Canales Individuales</h2>
+                <div id="channelList"></div>
+                
+                <script>
+                    const baseUrl = window.location.origin;
+                    document.querySelector('.url a').textContent = baseUrl + '/playlist.m3u8';
+                    
+                    document.getElementById('channelForm').onsubmit = async (e) => {
+                        e.preventDefault();
+                        const channels = document.getElementById('channels').value;
+                        
+                        const response = await fetch('/upload_channels', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({channels: channels})
+                        });
+                        
+                        const result = await response.json();
+                        updateChannelList(result.channels);
+                    };
+                    
+                    function updateChannelList(channels) {
+                        const list = document.getElementById('channelList');
+                        list.innerHTML = channels.map(channel => 
+                            `<div class="url">
+                                <strong>${channel}:</strong><br>
+                                <a href="/channel/${channel}" target="_blank">${baseUrl}/channel/${channel}</a>
+                            </div>`
+                        ).join('');
+                    }
+                </script>
+            </div>
+        </body>
+        </html>
+        """.replace('{{base_url}}', f"http://localhost:{self.port}")
+        
+        return Response(text=html, content_type='text/html')
+        
+    async def upload_channels(self, request: Request) -> Response:
+        """Procesa la lista de canales subida"""
+        try:
+            data = await request.json()
+            channels_text = data.get('channels', '')
+            channels = [ch.strip() for ch in channels_text.split('\n') if ch.strip()]
+            
+            # Guardar canales en archivo
+            with open('channels.txt', 'w') as f:
+                for channel in channels:
+                    f.write(f"{channel}\n")
+                    
+            return web.json_response({'status': 'success', 'channels': channels})
+            
+        except Exception as e:
+            logger.error(f"Error procesando canales: {str(e)}")
+            return web.json_response({'status': 'error', 'message': str(e)})
+            
+    async def load_channels(self) -> List[str]:
+        """Carga la lista de canales desde archivo"""
+        try:
+            if os.path.exists('channels.txt'):
+                with open('channels.txt', 'r') as f:
+                    return [line.strip() for line in f if line.strip()]
+            return []
+        except Exception as e:
+            logger.error(f"Error cargando canales: {str(e)}")
+            return []
+            
+    async def generate_playlist(self, request: Request) -> Response:
+        """Genera playlist M3U8 con todos los canales"""
+        try:
+            channels = await self.load_channels()
+            if not channels:
+                return Response(text="No hay canales configurados", status=404)
+                
+            base_url = f"http://{request.host}"
+            
+            m3u8_content = "#EXTM3U\n"
+            
+            for channel in channels:
+                m3u8_content += f"#EXTINF:-1,{channel.upper()}\n"
+                m3u8_content += f"{base_url}/channel/{channel}\n"
+                
+            return Response(
+                text=m3u8_content,
+                content_type='application/vnd.apple.mpegurl',
+                headers={
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-cache'
                 }
-                print(f"✅ M3U8 actualizado para {canal}: {m3u8_url}")
-                print(f"🌐 Base URL: {base_url}")
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generando playlist: {str(e)}")
+            return Response(text="Error interno del servidor", status=500)
+            
+    async def serve_channel(self, request: Request) -> Response:
+        """Sirve un canal específico"""
+        channel = request.match_info['channel']
+        
+        try:
+            # Verificar cache
+            cached = await self.get_cached_channel(channel)
+            if cached:
+                return await self.proxy_m3u8_content(cached['url'])
+                
+            # Extraer nueva URL
+            m3u8_url = await self.extract_m3u8_url(channel)
+            if not m3u8_url:
+                return Response(text=f"Canal {channel} no disponible", status=404)
+                
+            # Cachear y servir
+            await self.cache_channel(channel, m3u8_url)
+            return await self.proxy_m3u8_content(m3u8_url)
+            
+        except Exception as e:
+            logger.error(f"Error sirviendo canal {channel}: {str(e)}")
+            return Response(text="Error interno del servidor", status=500)
+            
+    async def proxy_m3u8_content(self, original_url: str) -> Response:
+        """Obtiene y modifica el contenido M3U8"""
+        try:
+            async with self.session.get(original_url, headers=self.headers) as response:
+                if response.status != 200:
+                    return Response(text="Stream no disponible", status=404)
+                    
+                content = await response.text()
+                
+                # Modificar URLs relativas en el M3U8
+                base_url = '/'.join(original_url.split('/')[:-1]) + '/'
+                modified_content = self.modify_m3u8_content(content, base_url)
+                
+                return Response(
+                    text=modified_content,
+                    content_type='application/vnd.apple.mpegurl',
+                    headers={
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': 'no-cache'
+                    }
+                )
+                
+        except Exception as e:
+            logger.error(f"Error obteniendo contenido M3U8: {str(e)}")
+            return Response(text="Error obteniendo stream", status=500)
+            
+    def modify_m3u8_content(self, content: str, base_url: str) -> str:
+        """Modifica el contenido M3U8 para usar el proxy"""
+        lines = content.split('\n')
+        modified_lines = []
+        
+        for line in lines:
+            if line.strip() and not line.startswith('#'):
+                # Es una URL de segmento
+                if line.startswith('http'):
+                    # URL absoluta - mantener como está por ahora
+                    modified_lines.append(line)
+                else:
+                    # URL relativa - convertir a absoluta
+                    absolute_url = urljoin(base_url, line)
+                    modified_lines.append(absolute_url)
             else:
-                print(f"❌ No se pudo obtener el M3U8 para {canal}")
-                abort(500, "No se pudo obtener el stream")
-    
-    cache_info = STREAM_CACHE[canal]
-    m3u8_url = cache_info['m3u8_url']
-    
-    try:
-        print(f"⬇️ Descargando M3U8 original: {m3u8_url}")
-        # Obtener el M3U8 original con TODOS los headers necesarios
-        r = requests.get(
-            m3u8_url, 
-            headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
-            timeout=20,
-            allow_redirects=True  # Importante para seguir redirecciones
-        )
-        print(f"📡 Estado de la respuesta M3U8: {r.status_code}")
-        if r.status_code != 200:
-            print(f"❌ Error HTTP {r.status_code} al obtener el M3U8")
-            print(f"Contenido de error: {r.text[:500]}")
+                modified_lines.append(line)
+                
+        return '\n'.join(modified_lines)
         
-        r.raise_for_status()
-        print(f"✅ M3U8 descargado exitosamente (tamaño: {len(r.text)} bytes)")
+    async def proxy_m3u8(self, request: Request) -> Response:
+        """Proxy para archivos M3U8"""
+        channel = request.match_info['channel']
+        return await self.serve_channel(request)
         
-        # Reescribir el contenido
-        content = r.text
-        rewritten_content = rewrite_m3u8(content, cache_info['base_url'], canal)
+    async def proxy_segment(self, request: Request) -> Response:
+        """Proxy para segmentos de video"""
+        channel = request.match_info['channel']
+        path = request.match_info['path']
         
-        # Configurar headers para HLS
-        response = Response(rewritten_content, mimetype="application/x-mpegurl")
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        response.headers['Content-Type'] = 'application/x-mpegurl'
-        response.headers['Accept-Ranges'] = 'bytes'
-        print(f"✅ Playlist reescrito y listo para enviar")
-        return response
-    except Exception as e:
-        print(f"❌ Error al obtener .m3u8 para {canal}: {str(e)}")
-        import traceback
-        print(f" traceback: {traceback.format_exc()}")
-        abort(502, "Error de conexión con el origen")
+        try:
+            cached = await self.get_cached_channel(channel)
+            if not cached:
+                return Response(text="Canal no encontrado", status=404)
+                
+            segment_url = cached['base_url'] + path
+            
+            async with self.session.get(segment_url, headers=self.headers) as response:
+                if response.status != 200:
+                    return Response(text="Segmento no disponible", status=404)
+                    
+                content = await response.read()
+                content_type = response.headers.get('content-type', 'video/mp2t')
+                
+                return Response(
+                    body=content,
+                    content_type=content_type,
+                    headers={'Access-Control-Allow-Origin': '*'}
+                )
+                
+        except Exception as e:
+            logger.error(f"Error proxy segmento: {str(e)}")
+            return Response(text="Error obteniendo segmento", status=500)
+            
+    async def start_server(self):
+        """Inicia el servidor"""
+        await self.init_session()
+        
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        
+        site = web.TCPSite(runner, '0.0.0.0', self.port)
+        await site.start()
+        
+        logger.info(f"Servidor iniciado en http://0.0.0.0:{self.port}")
+        logger.info(f"Playlist disponible en: http://0.0.0.0:{self.port}/playlist.m3u8")
+        
+        try:
+            await asyncio.Future()  # Mantener el servidor corriendo
+        except KeyboardInterrupt:
+            logger.info("Deteniendo servidor...")
+        finally:
+            await self.cleanup_session()
+            await runner.cleanup()
 
-@app.route('/proxy/segment/<canal>')
-def proxy_segment(canal):
-    if canal not in CHANNELS:
-        print(f"❌ Canal '{canal}' no está en la lista de canales permitidos")
-        abort(404, "Canal no encontrado")
-    
-    encoded_url = request.args.get("real_url")
-    if not encoded_url:
-        print("❌ URL no especificada en la solicitud de segmento")
-        abort(400, "URL no especificada")
-    
-    try:
-        # Decodificar la URL
-        real_url = unquote(encoded_url)
-        print(f"➡️ Solicitud de segmento para {canal}: {real_url}")
-        
-        # Descargar el recurso (ts, key, m3u8) con TODOS los headers necesarios
-        r = requests.get(
-            real_url, 
-            headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
-            stream=True, 
-            timeout=25,
-            verify=False  # Necesario para algunos servidores con SSL mal configurado
-        )
-        print(f"📡 Estado de la respuesta segmento: {r.status_code}")
-        if r.status_code != 200:
-            print(f"❌ Error HTTP {r.status_code} al obtener el segmento")
-        
-        r.raise_for_status()
-        print(f"✅ Segmento descargado exitosamente (tamaño: {len(r.content)} bytes)")
-        
-        # Configurar headers para HLS
-        headers = {}
-        for key, value in r.headers.items():
-            # Mantener todos los headers importantes
-            if key.lower() not in ['content-length', 'connection', 'transfer-encoding']:
-                headers[key] = value
-        
-        # Asegurar headers necesarios para HLS
-        headers['Access-Control-Allow-Origin'] = '*'
-        headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        headers['Accept-Ranges'] = 'bytes'
-        
-        # Devolver el contenido
-        return Response(
-            r.iter_content(chunk_size=8192),
-            status=r.status_code,
-            headers=headers
-        )
-    except Exception as e:
-        print(f"❌ Error proxyeando segmento para {canal}: {str(e)}")
-        import traceback
-        print(f" traceback: {traceback.format_exc()}")
-        abort(502, "Error al obtener el segmento")
-
-@app.route('/m3u')
-def generate_m3u():
-    base = request.host_url.rstrip("/")
-    print(f"📥 Generando lista M3U para {len(CHANNELS)} canales")
-    lines = ["#EXTM3U x-tvg-url=\"https://iptv-org.github.io/epg/guides/tvplus.com.epg.xml\""]
-    for canal in CHANNELS:
-        lines.append(
-            f'#EXTINF:-1 tvg-id="{canal}" tvg-name="{canal.title()}" '
-            f'group-title="StreamTPGlobal",{canal.title()}\n'
-            f'{base}/stream/{canal}.m3u8'
-        )
-    response = Response("\n".join(lines), mimetype="application/x-mpegurl")
-    response.headers['Content-Disposition'] = 'attachment; filename="playlist.m3u"'
-    print(f"✅ Lista M3U generada exitosamente")
-    return response
-
-@app.route('/')
-def home():
-    base = request.host_url.rstrip("/")
-    links = '<h1>📡 Proxy HLS de StreamTPGlobal</h1><ul>'
-    for canal in CHANNELS:
-        links += f'<li><a href="/stream/{canal}.m3u8">{canal}</a> | '
-        links += f'<a href="{base}/stream/{canal}.m3u8" target="_blank">🔗 URL</a></li>'
-    links += '</ul><p><a href="/m3u">📥 Descargar lista M3U</a></p>'
-    return links
-
-# Refresco automático en segundo plano
-def background_refresh():
-    while True:
-        time.sleep(240)
-        for canal in CHANNELS:
-            print(f"🔄 Actualizando caché en segundo plano para {canal}")
-            threading.Thread(target=extract_m3u8_url, args=(canal,), daemon=True).start()
+async def main():
+    """Función principal"""
+    port = int(os.environ.get('PORT', 8080))
+    server = M3U8ProxyServer(port=port)
+    await server.start_server()
 
 if __name__ == '__main__':
-    # Iniciar hilo de refresco
-    threading.Thread(target=background_refresh, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Iniciando servidor en el puerto {port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    asyncio.run(main())
