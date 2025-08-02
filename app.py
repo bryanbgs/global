@@ -64,6 +64,7 @@ class M3U8ProxyServer:
         self.app.router.add_get('/segment/{channel}/{path:.*}', self.proxy_segment)
         self.app.router.add_post('/upload_channels', self.upload_channels)
         self.app.router.add_get('/debug', self.debug_info)
+        self.app.router.add_get('/html/{channel}', self.get_raw_html)
         
         # Middleware para CORS
         self.app.middlewares.append(self.cors_middleware)
@@ -75,34 +76,75 @@ class M3U8ProxyServer:
             
     async def debug_info(self, request: web.Request) -> web.Response:
         """Información de debug del sistema"""
-        import sys
-        import platform
-        
-        debug_data = {
-            "system_info": {
-                "platform": platform.platform(),
-                "python_version": sys.version,
-                "aiohttp_version": aiohttp.__version__,
-            },
-            "environment": {
-                "PORT": os.environ.get('PORT', 'Not set'),
-                "RENDER": 'RENDER' in os.environ,
-                "Environment vars": list(os.environ.keys())
-            },
-            "session_info": {
-                "session_initialized": self.session is not None and not self.session.closed if self.session else False,
-                "cache_entries": len(self.channel_cache),
-                "cached_channels": list(self.channel_cache.keys())
-            },
-            "server_info": {
-                "host": request.host,
-                "scheme": request.scheme,
-                "client_ip": request.remote,
-                "user_agent": request.headers.get('User-Agent', 'Not provided')
+        try:
+            import sys
+            import platform
+            
+            debug_data = {
+                "system_info": {
+                    "platform": platform.platform(),
+                    "python_version": sys.version,
+                    "aiohttp_version": aiohttp.__version__,
+                },
+                "environment": {
+                    "PORT": os.environ.get('PORT', 'Not set'),
+                    "RENDER": 'RENDER' in os.environ,
+                    "DEBUG": os.environ.get('DEBUG', 'Not set'),
+                    "Environment_vars_count": len(os.environ)
+                },
+                "session_info": {
+                    "session_initialized": self.session is not None and not self.session.closed if self.session else False,
+                    "cache_entries": len(self.channel_cache),
+                    "cached_channels": list(self.channel_cache.keys())
+                },
+                "server_info": {
+                    "host": request.host,
+                    "scheme": request.scheme,
+                    "client_ip": request.remote,
+                    "user_agent": request.headers.get('User-Agent', 'Not provided')[:100]
+                }
             }
-        }
+            
+            return web.json_response(debug_data, indent=2)
+            
+        except Exception as e:
+            logger.error(f"💥 Error en debug_info: {str(e)}")
+            import traceback
+            logger.error(f"📋 Traceback: {traceback.format_exc()}")
+            return web.json_response({"error": str(e)}, status=500)
+            
+    async def get_raw_html(self, request: web.Request) -> web.Response:
+        """Obtiene el HTML raw de un canal para análisis manual"""
+        channel = request.match_info['channel']
         
-        return web.json_response(debug_data, indent=2)
+        try:
+            await self.init_session()
+            url = f"https://streamtpglobal.com/global1.php?stream={channel}"
+            
+            request_headers = self.headers.copy()
+            request_headers.update({
+                'Referer': 'https://streamtpglobal.com/',
+                'Origin': 'https://streamtpglobal.com'
+            })
+            
+            async with self.session.get(url, headers=request_headers) as response:
+                if response.status != 200:
+                    return web.Response(text=f"Error HTTP {response.status}", status=response.status)
+                
+                html_content = await response.text()
+                
+                # Formatear para mejor legibilidad
+                formatted_html = html_content.replace('><', '>\n<')
+                
+                return web.Response(
+                    text=formatted_html,
+                    content_type='text/plain; charset=utf-8',
+                    headers={'Content-Disposition': f'inline; filename="{channel}.html"'}
+                )
+                
+        except Exception as e:
+            logger.error(f"💥 Error obteniendo HTML para {channel}: {str(e)}")
+            return web.Response(text=f"Error: {str(e)}", status=500)
         
     @web.middleware
     async def cors_middleware(self, request, handler):
@@ -172,7 +214,8 @@ class M3U8ProxyServer:
             request_headers = self.headers.copy()
             request_headers.update({
                 'Referer': 'https://streamtpglobal.com/',
-                'Origin': 'https://streamtpglobal.com'
+                'Origin': 'https://streamtpglobal.com',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
             })
             
             async with self.session.get(url, headers=request_headers, allow_redirects=True) as response:
@@ -186,39 +229,77 @@ class M3U8ProxyServer:
                 html_content = await response.text()
                 logger.info(f"📄 Tamaño del contenido HTML: {len(html_content)} caracteres")
                 
-                # Log del contenido HTML para debug
-                logger.debug(f"🔍 HTML content preview (primeros 1000 chars):\n{html_content[:1000]}")
+                # Log del contenido HTML para debug (más extenso)
+                logger.debug(f"🔍 HTML content preview (primeros 2000 chars):\n{html_content[:2000]}")
                 
-                # Buscar URLs M3U8 usando múltiples patrones más específicos
-                patterns = [
-                    # Patrón principal para crackstreamslivehd
+                # Primero, buscar datos codificados en base64 en el JavaScript
+                # Basado en los logs, veo que hay un array Ky con datos codificados
+                base64_pattern = r'["\'][A-Za-z0-9+/=]{20,}["\']'
+                base64_matches = re.findall(base64_pattern, html_content)
+                
+                logger.info(f"🔍 Encontrados {len(base64_matches)} strings que parecen base64")
+                
+                for i, b64_match in enumerate(base64_matches[:10]):  # Solo los primeros 10
+                    try:
+                        # Limpiar comillas
+                        clean_b64 = b64_match.strip('"\'')
+                        # Intentar decodificar
+                        decoded = base64.b64decode(clean_b64 + '==').decode('utf-8', errors='ignore')
+                        logger.debug(f"🔓 Base64 {i+1} decodificado: {decoded}")
+                        
+                        # Buscar URLs M3U8 en el contenido decodificado
+                        if '.m3u8' in decoded and 'http' in decoded:
+                            logger.info(f"🎯 Posible URL M3U8 en base64: {decoded}")
+                            
+                            # Extraer la URL completa
+                            url_pattern = r'https?://[^\s<>"\']+\.m3u8[^\s<>"\']*'
+                            urls_in_decoded = re.findall(url_pattern, decoded)
+                            if urls_in_decoded:
+                                logger.info(f"🏆 URL M3U8 encontrada en base64: {urls_in_decoded[0]}")
+                                return urls_in_decoded[0]
+                                
+                    except Exception as decode_error:
+                        logger.debug(f"⚠️ Error decodificando base64 {i+1}: {decode_error}")
+                
+                # Buscar en variables JavaScript específicas
+                js_patterns = [
+                    r'playbackURL\s*=\s*["\']([^"\']+)["\']',
+                    r'var\s+\w*[uU]rl\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                    r'let\s+\w*[uU]rl\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                    r'const\s+\w*[uU]rl\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                    r'source\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                    r'src\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+                ]
+                
+                for i, pattern in enumerate(js_patterns):
+                    matches = re.findall(pattern, html_content, re.IGNORECASE)
+                    if matches:
+                        logger.info(f"🎯 Patrón JS {i+1} encontró: {matches}")
+                        for match in matches:
+                            if match and '.m3u8' in match:
+                                logger.info(f"🏆 URL M3U8 encontrada en JS: {match}")
+                                return match
+                
+                # Buscar patrones de URLs M3U8 directas
+                direct_patterns = [
                     r'https://[^/\s"\']+\.crackstreamslivehd\.com/[^/\s"\']+/tracks-v1a1/mono\.m3u8\?ip=[^&\s"\']+&token=[^"\s\']+',
-                    # Patrones alternativos
                     r'https://[^"\s\']+\.m3u8\?ip=[^&\s"\']+&token=[^"\s\']+',
                     r'"(https://[^"]+\.m3u8[^"]*)"',
                     r"'(https://[^']+\.m3u8[^']*)'",
-                    # Patrones para variables JavaScript
-                    r'source\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'src\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'var\s+\w+\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'let\s+\w+\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'const\s+\w+\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    # Patrones más generales
                     r'["\']([^"\']*\.m3u8[^"\']*)["\']',
                 ]
                 
                 all_matches = []
-                for i, pattern in enumerate(patterns):
+                for i, pattern in enumerate(direct_patterns):
                     try:
                         matches = re.findall(pattern, html_content, re.IGNORECASE | re.MULTILINE)
                         if matches:
-                            logger.info(f"🎯 Patrón {i+1} encontró {len(matches)} coincidencias: {matches}")
+                            logger.info(f"🎯 Patrón directo {i+1} encontró {len(matches)} coincidencias: {matches}")
                             all_matches.extend(matches)
                         else:
-                            logger.debug(f"⭕ Patrón {i+1} no encontró coincidencias")
+                            logger.debug(f"⭕ Patrón directo {i+1} no encontró coincidencias")
                     except Exception as pattern_error:
-                        logger.error(f"❌ Error en patrón {i+1}: {pattern_error}")
+                        logger.error(f"❌ Error en patrón directo {i+1}: {pattern_error}")
                 
                 # Filtrar y validar URLs encontradas
                 valid_urls = []
@@ -247,28 +328,57 @@ class M3U8ProxyServer:
                         logger.info(f"🏆 URL M3U8 SELECCIONADA (primera válida): {selected_url}")
                         return selected_url
                 
-                # Si no encontramos nada, buscar en scripts embebidos
+                # Análisis más profundo del JavaScript
+                logger.info("🔍 Analizando JavaScript más profundamente...")
+                
+                # Buscar en el array Ky que veo en los logs
+                ky_pattern = r'Ky\s*=\s*\[(.*?)\]'
+                ky_match = re.search(ky_pattern, html_content, re.DOTALL)
+                if ky_match:
+                    ky_content = ky_match.group(1)
+                    logger.info(f"🎯 Encontrado array Ky: {ky_content[:200]}...")
+                    
+                    # Extraer todos los strings base64 del array
+                    ky_b64_pattern = r'"([A-Za-z0-9+/=]{20,})"'
+                    ky_b64_matches = re.findall(ky_b64_pattern, ky_content)
+                    
+                    logger.info(f"🔍 Encontrados {len(ky_b64_matches)} elementos base64 en array Ky")
+                    
+                    for i, ky_b64 in enumerate(ky_b64_matches[:20]):  # Solo los primeros 20
+                        try:
+                            decoded_ky = base64.b64decode(ky_b64 + '==').decode('utf-8', errors='ignore')
+                            logger.debug(f"🔓 Ky[{i}] decodificado: {decoded_ky}")
+                            
+                            # Buscar patrones de URLs o dominios
+                            if any(domain in decoded_ky.lower() for domain in ['crackstream', 'stream', '.com', '.m3u8']):
+                                logger.info(f"🎯 Elemento Ky interesante: {decoded_ky}")
+                                
+                        except Exception as ky_error:
+                            logger.debug(f"⚠️ Error decodificando Ky[{i}]: {ky_error}")
+                
+                # Si aún no encontramos nada, buscar en scripts embebidos
                 logger.info("🔍 Buscando en scripts embebidos...")
                 script_pattern = r'<script[^>]*>(.*?)</script>'
                 scripts = re.findall(script_pattern, html_content, re.DOTALL | re.IGNORECASE)
                 
                 for i, script in enumerate(scripts):
                     logger.debug(f"📜 Analizando script {i+1} (longitud: {len(script)})")
-                    script_matches = re.findall(r'["\']([^"\']*\.m3u8[^"\']*)["\']', script)
-                    if script_matches:
-                        logger.info(f"🎯 Script {i+1} contiene URLs M3U8: {script_matches}")
-                        for script_match in script_matches:
-                            if script_match.startswith('http'):
-                                logger.info(f"🏆 URL M3U8 encontrada en script: {script_match}")
-                                return script_match
+                    if len(script) > 100:  # Solo scripts con contenido sustancial
+                        script_matches = re.findall(r'["\']([^"\']*\.m3u8[^"\']*)["\']', script)
+                        if script_matches:
+                            logger.info(f"🎯 Script {i+1} contiene URLs M3U8: {script_matches}")
+                            for script_match in script_matches:
+                                if script_match.startswith('http'):
+                                    logger.info(f"🏆 URL M3U8 encontrada en script: {script_match}")
+                                    return script_match
                 
                 logger.warning(f"❌ No se encontró URL M3U8 para canal: {channel}")
-                logger.info(f"📊 Total de patrones probados: {len(patterns)}")
+                logger.info(f"📊 Total de patrones probados: {len(direct_patterns)}")
                 logger.info(f"📊 Total de scripts analizados: {len(scripts)}")
                 
-                # Guardar HTML para debug (solo primeros 2000 caracteres)
-                debug_content = html_content[:2000] if len(html_content) > 2000 else html_content
-                logger.debug(f"🔍 Contenido HTML completo para debug:\n{debug_content}")
+                # Guardar más contenido HTML para debug
+                debug_content = html_content[:3000] if len(html_content) > 3000 else html_content
+                logger.debug(f"🔍 Contenido HTML extendido para debug:\n{debug_content}")
                 
                 return None
                 
