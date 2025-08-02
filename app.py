@@ -41,36 +41,70 @@ def load_channels():
 
 CHANNELS = load_channels()
 
-def extract_m3u8_url(canal):
+def extract_m3u8_url(canal, retry=2):
     url = BASE_URL.format(canal)
     try:
         session = requests.Session()
         session.headers.update(HEADERS)
-        response = session.get(url, timeout=10)
+        response = session.get(url, timeout=15)
         response.raise_for_status()
+        print(f"✅ Acceso exitoso a {url}")
 
         soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Estrategia 1: Buscar en scripts (regex mejorado)
         scripts = soup.find_all('script')
-
         for script in scripts:
             if script.string:
-                # Regex mejorado para capturar cualquier m3u8 con token
-                match = re.search(
-                    r'(https?://[^\s\'"\\<>]+\.m3u8\?ip=[^\s\'"\\<>]+&token=[^\s\'"\\<>]+)',
+                # Patrón mejorado para URLs m3u8 con token
+                matches = re.findall(
+                    r'https?://[^\s\'"\\<>]+\.m3u8\?[^\s\'"\\<>]+', 
                     script.string
                 )
-                if match:
-                    return match.group(1)
-                    
-        # Segunda estrategia: buscar en iframe src
-        iframe = soup.find('iframe')
-        if iframe and 'src' in iframe.attrs:
-            iframe_src = iframe['src']
-            if 'm3u8' in iframe_src:
-                return iframe_src
+                for match in matches:
+                    if 'token=' in match:
+                        print(f"✅ URL encontrada en script: {match}")
+                        return match
+        
+        # Estrategia 2: Buscar en iframes
+        iframes = soup.find_all('iframe')
+        for iframe in iframes:
+            src = iframe.get('src', '')
+            if '.m3u8' in src and 'token=' in src:
+                print(f"✅ URL encontrada en iframe: {src}")
+                return src
+        
+        # Estrategia 3: Buscar en elementos video
+        video_tags = soup.find_all('video')
+        for video in video_tags:
+            src = video.get('src', '')
+            if '.m3u8' in src and 'token=' in src:
+                print(f"✅ URL encontrada en video: {src}")
+                return src
+        
+        # Estrategia 4: Buscar en todo el cuerpo
+        body_text = str(soup.body)
+        matches = re.findall(
+            r'https?://[^\s\'"\\<>]+\.m3u8\?[^\s\'"\\<>]+', 
+            body_text
+        )
+        for match in matches:
+            if 'token=' in match:
+                print(f"✅ URL encontrada en body: {match}")
+                return match
                 
+        print(f"⚠️ No se encontró URL m3u8 en {url}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de conexión para {canal}: {e}")
+        if retry > 0:
+            print(f"🔄 Reintentando ({retry} intentos restantes)...")
+            time.sleep(2)
+            return extract_m3u8_url(canal, retry-1)
+            
     except Exception as e:
-        print(f"❌ Error extrayendo m3u8 para {canal}: {e}")
+        print(f"❌ Error inesperado para {canal}: {e}")
+        
     return None
 
 def rewrite_m3u8(content, base_url, canal):
@@ -104,15 +138,24 @@ def rewrite_m3u8(content, base_url, canal):
             continue
             
         # 3. Líneas de claves (EXT-X-KEY)
-        if '#EXT-X-KEY' in stripped and 'URI="' in stripped:
-            # Reescribir la URL de la clave
-            new_line = re.sub(
-                r'(URI=")([^"]+)"', 
-                lambda m: f'{m.group(1)}{url_for("proxy_segment", canal=canal, real_url=quote(m.group(2), safe=""), _external=True)}"', 
-                stripped
-            )
-            rewritten.append(new_line)
-            continue
+        if stripped.startswith('#EXT-X-KEY') and 'URI="' in stripped:
+            # Extraer y reescribir la URL de la clave
+            uri_match = re.search(r'URI="([^"]+)"', stripped)
+            if uri_match:
+                key_url = uri_match.group(1)
+                # Hacer la URL absoluta si es relativa
+                if not key_url.startswith('http'):
+                    key_url = urljoin(base_url, key_url)
+                # Crear URL proxy para la clave
+                encoded_key_url = quote(key_url, safe='')
+                proxy_key_url = url_for('proxy_segment', canal=canal, real_url=encoded_key_url, _external=True)
+                # Reemplazar en la línea
+                new_line = stripped.replace(uri_match.group(0), f'URI="{proxy_key_url}"')
+                rewritten.append(new_line)
+                continue
+            else:
+                rewritten.append(stripped)
+                continue
             
         # 4. Otras líneas (dejarlas igual)
         rewritten.append(line)
@@ -128,35 +171,41 @@ def proxy_playlist(canal):
     cached = STREAM_CACHE.get(canal)
     if not cached or time.time() > cached.get('expires', 0):
         with LOCK:
+            print(f"🔍 Actualizando caché para {canal}...")
             m3u8_url = extract_m3u8_url(canal)
             if m3u8_url:
                 # Calcular base_url correctamente
                 parsed = urlparse(m3u8_url)
                 base_url = f"{parsed.scheme}://{parsed.netloc}{os.path.dirname(parsed.path)}/"
+                if not base_url.endswith('/'):
+                    base_url += '/'
                 
                 STREAM_CACHE[canal] = {
                     'm3u8_url': m3u8_url,
                     'base_url': base_url,
                     'expires': time.time() + CACHE_TTL
                 }
+                print(f"🔄 Caché actualizada para {canal}")
             else:
+                print(f"❌ Fallo al obtener stream para {canal}")
                 abort(500, "No se pudo obtener el stream")
 
     cache_info = STREAM_CACHE[canal]
     m3u8_url = cache_info['m3u8_url']
+    base_url = cache_info['base_url']
 
     try:
         # Obtener el M3U8 original con headers actualizados
         r = requests.get(
             m3u8_url, 
             headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
-            timeout=10
+            timeout=15
         )
         r.raise_for_status()
 
         # Reescribir el contenido
         content = r.text
-        rewritten_content = rewrite_m3u8(content, cache_info['base_url'], canal)
+        rewritten_content = rewrite_m3u8(content, base_url, canal)
 
         # Configurar headers para HLS
         response = Response(rewritten_content, mimetype="application/x-mpegurl")
@@ -166,6 +215,9 @@ def proxy_playlist(canal):
 
     except Exception as e:
         print(f"❌ Error al obtener .m3u8: {e}")
+        # Intentar refrescar el caché si falla
+        with LOCK:
+            STREAM_CACHE.pop(canal, None)
         abort(502, "Error de conexión con el origen")
 
 @app.route('/proxy/segment/<canal>')
@@ -186,22 +238,24 @@ def proxy_segment(canal):
             real_url, 
             headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
             stream=True, 
-            timeout=15,
-            verify=False  # Necesario para algunos servidores con SSL mal configurado
+            timeout=20,
+            verify=False
         )
         r.raise_for_status()
 
-        # Configurar headers para HLS
-        headers = {}
-        for key, value in r.headers.items():
-            if key.lower() not in ['content-length', 'connection', 'transfer-encoding']:
-                headers[key] = value
-        headers['Access-Control-Allow-Origin'] = '*'
-        headers['Cache-Control'] = 'no-cache'
+        # Determinar tipo de contenido
+        content_type = 'video/MP2T'  # Por defecto para segmentos TS
+        if '.key' in real_url:
+            content_type = 'application/octet-stream'
+        elif '.m3u8' in real_url:
+            content_type = 'application/x-mpegurl'
 
-        # Determinar el tipo de contenido adecuado
-        content_type = 'video/MP2T' if '.ts' in real_url else 'application/octet-stream'
-        headers['Content-Type'] = content_type
+        # Configurar headers
+        headers = {
+            'Content-Type': content_type,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-cache, max-age=0'
+        }
 
         # Devolver el contenido
         return Response(
@@ -211,9 +265,12 @@ def proxy_segment(canal):
             content_type=content_type
         )
 
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de red al obtener segmento: {e}")
+        abort(502, "Error de red")
     except Exception as e:
-        print(f"❌ Error proxyeando segmento: {e}")
-        abort(502, "Error al obtener el segmento")
+        print(f"❌ Error inesperado al obtener segmento: {e}")
+        abort(500, "Error interno")
 
 @app.route('/m3u')
 def generate_m3u():
@@ -256,6 +313,14 @@ def home():
                 margin-top: 20px; 
             }
             .btn:hover { background: #0055aa; }
+            .status { 
+                padding: 3px 8px; 
+                border-radius: 3px; 
+                font-size: 0.8em;
+                margin-left: 10px;
+            }
+            .status-active { background: #4CAF50; color: white; }
+            .status-inactive { background: #f44336; color: white; }
         </style>
     </head>
     <body>
@@ -265,32 +330,67 @@ def home():
     '''
     
     for canal in CHANNELS:
-        links += f'<li><a href="/stream/{canal}.m3u8">{canal}</a> | '
-        links += f'<a href="{base}/stream/{canal}.m3u8" target="_blank">🔗 URL</a></li>'
+        cache_status = "🟢" if canal in STREAM_CACHE else "🔴"
+        links += f'''
+        <li>
+            {cache_status} <a href="/stream/{canal}.m3u8">{canal}</a> | 
+            <a href="{base}/stream/{canal}.m3u8" target="_blank">🔗 URL</a>
+        </li>'''
     
     links += '''
         </ul>
         <a href="/m3u" class="btn">📥 Descargar lista M3U completa</a>
-        <p><small>Actualización automática cada 5 minutos</small></p>
+        <p><small>Actualización automática cada 5 minutos | Canales en caché: {}/{}</small></p>
     </body>
     </html>
-    '''
+    '''.format(len(STREAM_CACHE), len(CHANNELS))
     return links
 
 # Refresco automático en segundo plano
 def background_refresh():
     while True:
-        time.sleep(240)  # Actualizar cada 4 minutos
-        print("🔄 Actualizando caché de streams...")
+        print("\n🔄 Iniciando actualización de caché...")
+        start_time = time.time()
+        updated = 0
+        
         for canal in CHANNELS:
             try:
-                threading.Thread(target=extract_m3u8_url, args=(canal,), daemon=True).start()
+                print(f"  🔍 Actualizando {canal}...")
+                m3u8_url = extract_m3u8_url(canal)
+                if m3u8_url:
+                    parsed = urlparse(m3u8_url)
+                    base_url = f"{parsed.scheme}://{parsed.netloc}{os.path.dirname(parsed.path)}/"
+                    if not base_url.endswith('/'):
+                        base_url += '/'
+                    
+                    with LOCK:
+                        STREAM_CACHE[canal] = {
+                            'm3u8_url': m3u8_url,
+                            'base_url': base_url,
+                            'expires': time.time() + CACHE_TTL
+                        }
+                    updated += 1
+                    print(f"  ✅ {canal} actualizado")
+                else:
+                    print(f"  ⚠️ No se pudo actualizar {canal}")
             except Exception as e:
-                print(f"Error en refresco automático para {canal}: {e}")
+                print(f"  ❌ Error actualizando {canal}: {e}")
+        
+        elapsed = time.time() - start_time
+        print(f"✅ Actualización completada: {updated}/{len(CHANNELS)} canales en {elapsed:.2f}s")
+        print(f"⏳ Próxima actualización en 4 minutos...")
+        time.sleep(240)
 
 if __name__ == '__main__':
+    # Precargar caché al iniciar
+    print("⏳ Precargando caché de canales...")
+    for canal in CHANNELS:
+        threading.Thread(target=extract_m3u8_url, args=(canal,), daemon=True).start()
+    time.sleep(5)
+    
     # Iniciar hilo de refresco
-    threading.Thread(target=background_refresh, daemon=True).start()
+    refresh_thread = threading.Thread(target=background_refresh, daemon=True)
+    refresh_thread.start()
     
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
