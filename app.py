@@ -10,8 +10,8 @@ from urllib.parse import urljoin, urlparse, quote, unquote
 
 app = Flask(__name__)
 
-# URL base actualizada para streamtpglobal.com
-BASE_URL = "https://streamtpglobal.com/global2.php?stream={}"
+# URL base CORREGIDA para streamtpglobal.com
+BASE_URL = "https://streamtpglobal.com/global1.php?stream={}"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -33,8 +33,8 @@ def load_channels():
                     channels.append(line)
     except FileNotFoundError:
         print("⚠️ canales.txt no encontrado")
-        # Para pruebas iniciales, incluyo algunos canales de ejemplo
-        channels = ["espn", "espn2", "foxsports", "beinsports"]
+        # Agregamos canales de ejemplo para pruebas
+        channels = ["espn", "espn2", "foxsports", "beinsports", "fox1ar"]
     return channels
 
 CHANNELS = load_channels()
@@ -44,19 +44,31 @@ def extract_m3u8_url(canal):
     try:
         session = requests.Session()
         session.headers.update(HEADERS)
-        response = session.get(url, timeout=10)
+        response = session.get(url, timeout=15)
         response.raise_for_status()
+        
+        # Intentar encontrar la URL M3U8 en el HTML
         soup = BeautifulSoup(response.content, 'html.parser')
         scripts = soup.find_all('script')
+        
         for script in scripts:
             if script.string:
-                # Regex mejorado para capturar cualquier m3u8 con cualquier parámetro
-                # Esto captura URLs como: https://*.crackstreamslivehd.com/.../mono.m3u8?ip=...&token=...
-                match = re.search(r'(https?://[^\s\'"\\<>]+\.m3u8[^\s\'"\\<>]*)', script.string)
+                # REGEX CORREGIDA - busca cualquier URL .m3u8 con cualquier parámetro
+                match = re.search(r'(https?://[^\s\'"\\<>]+\.m3u8[^\s\'"]*)', script.string)
                 if match:
-                    return match.group(1)
+                    m3u8_url = match.group(1)
+                    print(f"✅ URL M3U8 encontrada para {canal}: {m3u8_url}")
+                    return m3u8_url
+        
+        # Si no se encuentra en los scripts, intentar en el HTML completo
+        match = re.search(r'(https?://[^\s\'"\\<>]+\.m3u8[^\s\'"]*)', response.text)
+        if match:
+            m3u8_url = match.group(1)
+            print(f"✅ URL M3U8 encontrada (HTML) para {canal}: {m3u8_url}")
+            return m3u8_url
+            
     except Exception as e:
-        print(f"❌ Error extrayendo m3u8 para {canal}: {e}")
+        print(f"❌ Error extrayendo m3u8 para {canal}: {str(e)}")
     return None
 
 def rewrite_m3u8(content, base_url, canal):
@@ -101,7 +113,9 @@ def rewrite_m3u8(content, base_url, canal):
 @app.route('/stream/<canal>.m3u8')
 def proxy_playlist(canal):
     if canal not in CHANNELS:
+        print(f"❌ Canal '{canal}' no está en la lista de canales permitidos")
         abort(404, "Canal no encontrado")
+    
     # Obtener o actualizar caché
     cached = STREAM_CACHE.get(canal)
     if not cached or time.time() > cached.get('expires', 0):
@@ -116,16 +130,20 @@ def proxy_playlist(canal):
                     'base_url': base_url,
                     'expires': time.time() + CACHE_TTL
                 }
+                print(f"🔄 M3U8 actualizado para {canal}: {m3u8_url}")
             else:
+                print(f"❌ No se pudo obtener el M3U8 para {canal}")
                 abort(500, "No se pudo obtener el stream")
+    
     cache_info = STREAM_CACHE[canal]
     m3u8_url = cache_info['m3u8_url']
+    
     try:
         # Obtener el M3U8 original
         r = requests.get(
             m3u8_url, 
             headers={**HEADERS, "Referer": "https://streamtpglobal.com/"},
-            timeout=10
+            timeout=15
         )
         r.raise_for_status()
         # Reescribir el contenido
@@ -137,7 +155,7 @@ def proxy_playlist(canal):
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         return response
     except Exception as e:
-        print(f"❌ Error al obtener .m3u8: {e}")
+        print(f"❌ Error al obtener .m3u8 para {canal}: {str(e)}")
         abort(502, "Error de conexión con el origen")
 
 @app.route('/proxy/segment/<canal>')
@@ -150,12 +168,13 @@ def proxy_segment(canal):
     try:
         # Decodificar la URL
         real_url = unquote(encoded_url)
+        print(f"🔗 Proxyeando segmento: {real_url}")
         # Descargar el recurso (ts, key, m3u8)
         r = requests.get(
             real_url, 
             headers=HEADERS, 
             stream=True, 
-            timeout=15,
+            timeout=20,
             verify=False  # Necesario para algunos servidores con SSL mal configurado
         )
         r.raise_for_status()
@@ -173,7 +192,7 @@ def proxy_segment(canal):
             headers=headers
         )
     except Exception as e:
-        print(f"❌ Error proxyeando segmento: {e}")
+        print(f"❌ Error proxyeando segmento para {canal}: {str(e)}")
         abort(502, "Error al obtener el segmento")
 
 @app.route('/m3u')
@@ -211,4 +230,4 @@ if __name__ == '__main__':
     # Iniciar hilo de refresco
     threading.Thread(target=background_refresh, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)  # debug=True para ver más detalles en los logs
