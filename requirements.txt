@@ -1,4 +1,4 @@
 aiohttp==3.9.1
 aiofiles==23.2.1
-asyncio
 gunicorn==21.2.0
+aiohttp-wsgi==0.9.1
